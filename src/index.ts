@@ -7,6 +7,8 @@ import {
 } from './types'
 import { transformFlightDetail, computeObserver } from './helpers'
 import { pointInPolygon, haversine } from './geojson'
+import { resolveUnitOptions, buildUnitsMeta, convertFlightResult, convertDistanceFromKm } from './units'
+import openApiSpec from './openapi.yaml'
 
 const CACHE_TTL = 60  // seconds (KV minimum is 60)
 const TILE_DEG = 5    // degrees per grid tile
@@ -28,20 +30,13 @@ app.onError((err, c) => {
 
 app.get('/', (c) => c.redirect('https://koiosdigital.net/products/matrx?utm_source=flights-api'))
 
-app.get('/health', (c) => c.json({ status: 'ok' }))
-
-app.get('/flights', async (c) => {
-  const kv = c.env.CACHE
-  const cached = await kv.get('flights:all', 'json')
-  if (cached) return c.json(cached)
-
-  const api = new FlightRadar24API()
-  const flights = await api.getFlights()
-  c.executionCtx.waitUntil(kv.put('flights:all', JSON.stringify(flights), { expirationTtl: CACHE_TTL }))
-  return c.json(flights)
+app.get('/swagger.yaml', (c) => {
+  return c.body(openApiSpec, 200, { 'Content-Type': 'text/yaml' })
 })
 
-app.get('/flight/:id', async (c) => {
+app.get('/health', (c) => c.json({ status: 'ok' }))
+
+app.get('/flights/:id', async (c) => {
   const id = c.req.param('id')
   if (!id) {
     return c.json({ error: 'Missing id parameter' }, 400)
@@ -60,6 +55,9 @@ app.get('/flight/:id', async (c) => {
     return c.json({ error: 'lat and lng must be valid numbers' }, 400)
   }
 
+  // Unit options
+  const unitOpts = resolveUnitOptions(c.req.query('unit'), c.req.query('speed_unit'))
+
   const kv = c.env.CACHE
   const key = `flight:${id}`
 
@@ -76,9 +74,13 @@ app.get('/flight/:id', async (c) => {
   if (observerLat !== undefined && observerLng !== undefined && result.telemetry) {
     result = {
       ...result,
-      ...computeObserver(observerLat, observerLng, result.telemetry.latitude, result.telemetry.longitude),
+      ...computeObserver(observerLat, observerLng, result.telemetry.latitude, result.telemetry.longitude, unitOpts),
     }
   }
+
+  // Apply unit conversion and attach units metadata
+  result = convertFlightResult(result, unitOpts)
+  result.units = buildUnitsMeta(unitOpts)
 
   return c.json(result)
 })
@@ -109,6 +111,8 @@ function tileBounds(north: number, south: number, west: number, east: number) {
 }
 
 app.post('/flights/nearby', async (c) => {
+  const unitOpts = resolveUnitOptions(c.req.query('unit'), c.req.query('speed_unit'))
+
   let body: GeoJSONFeatureCollection
   try {
     body = await c.req.json()
@@ -203,16 +207,19 @@ app.post('/flights/nearby', async (c) => {
       latitude: f.latitude,
       longitude: f.longitude,
       ...(pointFeature ? {
-        distanceKm: Math.round(haversine(
-          (pointFeature.geometry.coordinates as number[])[1],
-          (pointFeature.geometry.coordinates as number[])[0],
-          f.latitude,
-          f.longitude
-        ) * 10) / 10
+        distance: convertDistanceFromKm(
+          haversine(
+            (pointFeature.geometry.coordinates as number[])[1],
+            (pointFeature.geometry.coordinates as number[])[0],
+            f.latitude,
+            f.longitude,
+          ),
+          unitOpts,
+        ),
       } : {}),
     })))
   } catch (err) {
-    return c.json({ error: 'Failed to fetch flight data' }, 500)
+    return c.json(err, 500)
   }
 })
 

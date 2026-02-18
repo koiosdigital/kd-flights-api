@@ -1,0 +1,467 @@
+openapi: 3.1.0
+info:
+  title: Koios Flights API
+  version: 1.0.0
+  description: Real-time flight tracking API powered by FlightRadar24 data.
+
+servers:
+  - url: https://flights-api.koiosdigital.net
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: getHealth
+      responses:
+        "200":
+          description: API is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /flights/{id}:
+    get:
+      summary: Get flight details
+      operationId: getFlightById
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: FlightRadar24 flight identifier
+          schema:
+            type: string
+        - name: lat
+          in: query
+          description: Observer latitude. Must be provided together with `lng`.
+          schema:
+            type: number
+            format: double
+        - name: lng
+          in: query
+          description: Observer longitude. Must be provided together with `lat`.
+          schema:
+            type: number
+            format: double
+        - name: unit
+          in: query
+          description: Unit system for the response. Defaults to `imperial`.
+          schema:
+            type: string
+            enum: [imperial, metric]
+            default: imperial
+        - name: speed_unit
+          in: query
+          description: >
+            Speed and distance unit. Defaults to `knots` when unit=imperial,
+            `kilometers` when unit=metric.
+          schema:
+            type: string
+            enum: [knots, miles, kilometers]
+      responses:
+        "200":
+          description: Flight details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FlightDetail"
+        "400":
+          description: Invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /flights/nearby:
+    post:
+      summary: Find flights within a polygon
+      operationId: getFlightsNearby
+      parameters:
+        - name: unit
+          in: query
+          schema:
+            type: string
+            enum: [imperial, metric]
+            default: imperial
+        - name: speed_unit
+          in: query
+          schema:
+            type: string
+            enum: [knots, miles, kilometers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NearbyRequest"
+      responses:
+        "200":
+          description: List of flights inside the polygon
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NearbyFlight"
+        "400":
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+
+    UnitsMeta:
+      type: object
+      description: Describes the units used in the response.
+      properties:
+        system:
+          type: string
+          enum: [imperial, metric]
+        altitude:
+          type: string
+          enum: [ft, m]
+        speed:
+          type: string
+          enum: [kn, mph, km/h]
+        verticalSpeed:
+          type: string
+          enum: [ft/min, m/min]
+        distance:
+          type: string
+          enum: [nm, km, mi]
+
+    Position:
+      type: object
+      properties:
+        lat:
+          type: number
+          format: double
+          nullable: true
+        lng:
+          type: number
+          format: double
+          nullable: true
+        altitude:
+          type: number
+          nullable: true
+          description: Airport elevation in the requested unit system.
+
+    Airport:
+      type: object
+      nullable: true
+      properties:
+        iata:
+          type: string
+          nullable: true
+        icao:
+          type: string
+          nullable: true
+        name:
+          type: string
+          nullable: true
+        city:
+          type: string
+          nullable: true
+        country:
+          type: string
+          nullable: true
+        position:
+          $ref: "#/components/schemas/Position"
+        timezone:
+          type: string
+          nullable: true
+        gate:
+          type: string
+          nullable: true
+        terminal:
+          type: string
+          nullable: true
+
+    Airline:
+      type: object
+      properties:
+        name:
+          type: string
+        iata:
+          type: string
+          nullable: true
+        icao:
+          type: string
+          nullable: true
+        logoUrl:
+          type: string
+          format: uri
+
+    Identification:
+      type: object
+      properties:
+        id:
+          type: string
+          nullable: true
+        callsign:
+          type: string
+          nullable: true
+        flightNumber:
+          type: string
+          nullable: true
+        displayName:
+          type: string
+          nullable: true
+          description: Human-readable name, e.g. "United 845"
+        airline:
+          $ref: "#/components/schemas/Airline"
+
+    Aircraft:
+      type: object
+      properties:
+        model:
+          type: string
+          nullable: true
+        typeCode:
+          type: string
+          nullable: true
+          description: ICAO type designator, e.g. "B738"
+        registration:
+          type: string
+          nullable: true
+        hex:
+          type: string
+          nullable: true
+          description: Mode-S hex code
+        imageUrl:
+          type: string
+          format: uri
+          nullable: true
+
+    Telemetry:
+      type: object
+      nullable: true
+      properties:
+        latitude:
+          type: number
+          format: double
+        longitude:
+          type: number
+          format: double
+        altitude:
+          type: number
+          description: In units indicated by `units.altitude`.
+        groundSpeed:
+          type: number
+          description: In units indicated by `units.speed`.
+        heading:
+          type: number
+          description: Degrees (0-360).
+        verticalSpeed:
+          type: number
+          description: In units indicated by `units.verticalSpeed`.
+        onGround:
+          type: boolean
+        timestamp:
+          type: integer
+          description: Unix timestamp of the telemetry snapshot.
+
+    Observer:
+      type: object
+      description: Present only when `lat` and `lng` query params are provided.
+      properties:
+        bearingFromObserver:
+          type: number
+          description: Degrees (0-360) from observer to aircraft.
+        distance:
+          type: number
+          description: In units indicated by `units.distance`.
+        cardinalDirection:
+          type: string
+          description: 16-point cardinal direction, e.g. "NNE".
+
+    RunwayInfo:
+      type: object
+      properties:
+        designator:
+          type: string
+          description: Runway designator, e.g. "09L".
+        heading:
+          type: number
+          description: Runway true heading in degrees.
+        headingDelta:
+          type: number
+          description: Degrees difference between aircraft and runway heading.
+        reciprocal:
+          type: string
+          description: Opposite runway designator, e.g. "27R".
+
+    Phase:
+      type: object
+      properties:
+        state:
+          type: string
+          enum:
+            - parked
+            - taxiing
+            - takeoff_roll
+            - climbing
+            - cruising
+            - descending
+            - approach
+            - final_approach
+            - landed
+        label:
+          type: string
+          description: Human-readable phase description, e.g. "Cruising at FL350".
+        departureRunway:
+          $ref: "#/components/schemas/RunwayInfo"
+        runway:
+          $ref: "#/components/schemas/RunwayInfo"
+
+    TimingPair:
+      type: object
+      properties:
+        departure:
+          type: integer
+          nullable: true
+          description: Unix timestamp.
+        arrival:
+          type: integer
+          nullable: true
+          description: Unix timestamp.
+
+    Timing:
+      type: object
+      properties:
+        scheduled:
+          $ref: "#/components/schemas/TimingPair"
+        actual:
+          $ref: "#/components/schemas/TimingPair"
+        estimated:
+          $ref: "#/components/schemas/TimingPair"
+        delay:
+          type: object
+          properties:
+            isDelayed:
+              type: boolean
+            departureDelayMinutes:
+              type: number
+              nullable: true
+            arrivalDelayMinutes:
+              type: number
+              nullable: true
+
+    Progress:
+      type: object
+      properties:
+        fraction:
+          type: number
+          description: 0-1 completion ratio.
+        percent:
+          type: integer
+          description: 0-100 completion percentage.
+        elapsedSeconds:
+          type: integer
+          nullable: true
+        remainingSeconds:
+          type: integer
+          nullable: true
+
+    Status:
+      type: object
+      properties:
+        live:
+          type: boolean
+        text:
+          type: string
+          nullable: true
+
+    FlightDetail:
+      type: object
+      properties:
+        identification:
+          $ref: "#/components/schemas/Identification"
+        aircraft:
+          $ref: "#/components/schemas/Aircraft"
+        route:
+          type: object
+          properties:
+            origin:
+              $ref: "#/components/schemas/Airport"
+            destination:
+              $ref: "#/components/schemas/Airport"
+        telemetry:
+          $ref: "#/components/schemas/Telemetry"
+        observer:
+          $ref: "#/components/schemas/Observer"
+        timing:
+          $ref: "#/components/schemas/Timing"
+        progress:
+          $ref: "#/components/schemas/Progress"
+        phase:
+          $ref: "#/components/schemas/Phase"
+        status:
+          $ref: "#/components/schemas/Status"
+        units:
+          $ref: "#/components/schemas/UnitsMeta"
+
+    NearbyRequest:
+      type: object
+      description: >
+        GeoJSON FeatureCollection containing a Polygon feature (search area)
+        and an optional Point feature with `role: "point"` (for distance sorting).
+      properties:
+        type:
+          type: string
+          enum: [FeatureCollection]
+        features:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+                enum: [Feature]
+              geometry:
+                type: object
+                properties:
+                  type:
+                    type: string
+                    enum: [Polygon, Point]
+                  coordinates: {}
+              properties:
+                type: object
+                properties:
+                  role:
+                    type: string
+                    enum: [polygon, point]
+      required: [type, features]
+
+    NearbyFlight:
+      type: object
+      properties:
+        id:
+          type: string
+        callsign:
+          type: string
+        latitude:
+          type: number
+          format: double
+        longitude:
+          type: number
+          format: double
+        distance:
+          type: number
+          description: >
+            Distance from the Point feature, in units indicated by the
+            unit/speed_unit params. Present only when a Point feature is
+            included in the request.

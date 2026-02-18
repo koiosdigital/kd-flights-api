@@ -3,6 +3,7 @@ import airlinesRaw from '../data/airlines.csv'
 import airportsRaw from '../data/airports-slim.csv'
 import runwaysRaw from '../data/runways-slim.csv'
 import { haversine } from './geojson'
+import { type UnitOptions, convertDistanceFromKm } from './units'
 
 const LOGO_BASE = 'https://flightaware.com/images/airline_logos/90p'
 
@@ -531,14 +532,16 @@ export function computeObserver(
   observerLng: number,
   flightLat: number,
   flightLng: number,
+  unitOpts?: UnitOptions,
 ) {
   const bearing = computeBearing(observerLat, observerLng, flightLat, flightLng)
   const distKm = haversine(observerLat, observerLng, flightLat, flightLng)
   return {
     observer: {
       bearingFromObserver: Math.round(bearing * 10) / 10,
-      distanceKm: Math.round(distKm * 10) / 10,
-      distanceNm: Math.round((distKm / 1.852) * 10) / 10,
+      distance: unitOpts
+        ? convertDistanceFromKm(distKm, unitOpts)
+        : Math.round((distKm / 1.852) * 10) / 10,
       cardinalDirection: cardinalDirection(bearing),
     },
   }
@@ -560,6 +563,7 @@ export type EnhancedFlightPhase =
 export interface EnhancedPhaseResult {
   state: EnhancedFlightPhase
   label: string
+  altitudeRaw?: number
   runway?: RunwayResult
   departureRunway?: RunwayResult
 }
@@ -644,6 +648,7 @@ export function inferPhaseFromTrail(
     return {
       state: 'climbing',
       label: `Climbing through ${formatAltitude(alt)}`,
+      altitudeRaw: alt,
       departureRunway,
     }
   }
@@ -653,6 +658,7 @@ export function inferPhaseFromTrail(
     return {
       state: 'climbing',
       label: `Climbing through ${formatAltitude(alt)}`,
+      altitudeRaw: alt,
       departureRunway,
     }
   }
@@ -662,6 +668,7 @@ export function inferPhaseFromTrail(
     return {
       state: 'descending',
       label: `Descending through ${formatAltitude(alt)}`,
+      altitudeRaw: alt,
       departureRunway,
     }
   }
@@ -670,6 +677,7 @@ export function inferPhaseFromTrail(
   return {
     state: 'cruising',
     label: `Cruising at ${formatAltitude(alt)}`,
+    altitudeRaw: alt,
     departureRunway,
   }
 }
@@ -687,7 +695,7 @@ function extractAirport(ap: any) {
     position: {
       lat: ap.position?.latitude ?? null,
       lng: ap.position?.longitude ?? null,
-      altitudeFt: ap.position?.altitude ?? null,
+      altitude: ap.position?.altitude ?? null,
     },
     timezone: ap.timezone?.name ?? null,
     gate: ap.info?.gate ?? null,
@@ -695,11 +703,7 @@ function extractAirport(ap: any) {
   }
 }
 
-export function transformFlightDetail(
-  raw: any,
-  observerLat?: number,
-  observerLng?: number,
-) {
+export function transformFlightDetail(raw: any) {
   // ── Identification ──
   const callsign = raw.identification?.callsign ?? null
   const flightNumber = raw.identification?.number?.default ?? null
@@ -743,19 +747,6 @@ export function transformFlightDetail(
     onGround: current.alt === 0,
     timestamp: current.ts,
   } : null
-
-  // ── Observer ──
-  let observer: any = undefined
-  if (observerLat !== undefined && observerLng !== undefined && current) {
-    const bearing = computeBearing(observerLat, observerLng, current.lat, current.lng)
-    const distKm = haversine(observerLat, observerLng, current.lat, current.lng)
-    observer = {
-      bearingFromObserver: Math.round(bearing * 10) / 10,
-      distanceKm: Math.round(distKm * 10) / 10,
-      distanceNm: Math.round((distKm / 1.852) * 10) / 10,
-      cardinalDirection: cardinalDirection(bearing),
-    }
-  }
 
   // ── Timing ──
   const time = raw.time ?? {}
@@ -831,7 +822,6 @@ export function transformFlightDetail(
     },
     route: { origin, destination },
     telemetry,
-    ...(observer ? { observer } : {}),
     timing: {
       scheduled: { departure: scheduledDep, arrival: scheduledArr },
       actual: { departure: actualDep, arrival: actualArr },
@@ -851,6 +841,7 @@ export function transformFlightDetail(
     phase: {
       state: phase.state,
       label: phase.label,
+      altitudeRaw: phase.altitudeRaw ?? null,
       ...(phase.departureRunway ? {
         departureRunway: {
           designator: phase.departureRunway.runway,
