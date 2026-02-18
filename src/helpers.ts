@@ -618,7 +618,7 @@ export function inferPhaseFromTrail(
   if (onGround) {
     if (spd <= 2) {
       const gate = hasDeparted ? destGateStr : originGateStr
-      const label = gate ? `At gate ${gate}` : 'At gate'
+      const label = gate ? `At gate ${gate}` : hasDeparted ? 'Arrived' : 'At gate'
       return { state: 'parked', label, departureRunway }
     }
     if (spd >= 30 && acceleration > 0.5 && headingStable) {
