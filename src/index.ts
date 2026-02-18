@@ -191,14 +191,26 @@ app.post('/flights/nearby', async (c) => {
       pointInPolygon(f.longitude, f.latitude, outerRing)
     )
 
+    // Blocked callsigns sort to the bottom
+    const isBlocked = (cs: string | null) =>
+      !cs || /^x{3,}$/i.test(cs) || /blocked/i.test(cs)
+
     // Sort by distance to point if provided, otherwise by callsign
     if (pointFeature) {
       const [pLng, pLat] = pointFeature.geometry.coordinates as number[]
-      flights.sort((a: any, b: any) =>
-        haversine(pLat, pLng, a.latitude, a.longitude) - haversine(pLat, pLng, b.latitude, b.longitude)
-      )
+      flights.sort((a: any, b: any) => {
+        const aBlocked = isBlocked(a.callsign)
+        const bBlocked = isBlocked(b.callsign)
+        if (aBlocked !== bBlocked) return aBlocked ? 1 : -1
+        return haversine(pLat, pLng, a.latitude, a.longitude) - haversine(pLat, pLng, b.latitude, b.longitude)
+      })
     } else {
-      flights.sort((a: any, b: any) => (a.callsign || '').localeCompare(b.callsign || ''))
+      flights.sort((a: any, b: any) => {
+        const aBlocked = isBlocked(a.callsign)
+        const bBlocked = isBlocked(b.callsign)
+        if (aBlocked !== bBlocked) return aBlocked ? 1 : -1
+        return (a.callsign || '').localeCompare(b.callsign || '')
+      })
     }
 
     return c.json(flights.map((f: any) => ({
