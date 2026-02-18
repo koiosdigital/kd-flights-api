@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { type D1Database } from '@cloudflare/workers-types'
+import { type D1Database, type KVNamespace } from '@cloudflare/workers-types'
 
 export interface GeoJSONFeature {
     type: 'Feature'
@@ -20,6 +20,7 @@ export type CloudflareBindings = {
     JWT_SHARED_SECRET: string
     PKI_ENCRYPTION_SECRET: string
     db: D1Database
+    CACHE: KVNamespace
 }
 
 const BASE64_REGEX = /^[A-Za-z0-9+/=]+$/

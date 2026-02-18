@@ -526,6 +526,24 @@ function cardinalDirection(bearing: number): string {
   return dirs[Math.round(bearing / 22.5) % 16]
 }
 
+export function computeObserver(
+  observerLat: number,
+  observerLng: number,
+  flightLat: number,
+  flightLng: number,
+) {
+  const bearing = computeBearing(observerLat, observerLng, flightLat, flightLng)
+  const distKm = haversine(observerLat, observerLng, flightLat, flightLng)
+  return {
+    observer: {
+      bearingFromObserver: Math.round(bearing * 10) / 10,
+      distanceKm: Math.round(distKm * 10) / 10,
+      distanceNm: Math.round((distKm / 1.852) * 10) / 10,
+      cardinalDirection: cardinalDirection(bearing),
+    },
+  }
+}
+
 // ── Enhanced state machine ──────────────────────────────────────────
 
 export type EnhancedFlightPhase =

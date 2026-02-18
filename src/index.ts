@@ -5,8 +5,12 @@ import {
   type CloudflareBindings,
   type GeoJSONFeatureCollection,
 } from './types'
-import { transformFlightDetail } from './helpers'
+import { transformFlightDetail, computeObserver } from './helpers'
 import { pointInPolygon, haversine } from './geojson'
+
+const CACHE_TTL = 60  // seconds (KV minimum is 60)
+const TILE_DEG = 5    // degrees per grid tile
+const MAX_TILES = 12  // cap parallel FR24 calls for large viewports
 
 const app = new Hono<{ Bindings: CloudflareBindings }>()
 
@@ -27,8 +31,13 @@ app.get('/', (c) => c.redirect('https://koiosdigital.net/products/matrx?utm_sour
 app.get('/health', (c) => c.json({ status: 'ok' }))
 
 app.get('/flights', async (c) => {
+  const kv = c.env.CACHE
+  const cached = await kv.get('flights:all', 'json')
+  if (cached) return c.json(cached)
+
   const api = new FlightRadar24API()
   const flights = await api.getFlights()
+  c.executionCtx.waitUntil(kv.put('flights:all', JSON.stringify(flights), { expirationTtl: CACHE_TTL }))
   return c.json(flights)
 })
 
@@ -51,10 +60,53 @@ app.get('/flight/:id', async (c) => {
     return c.json({ error: 'lat and lng must be valid numbers' }, 400)
   }
 
-  const api = new FlightRadar24API()
-  const raw = await api.getFlightDetails({ id } as Flight)
-  return c.json(transformFlightDetail(raw, observerLat, observerLng))
+  const kv = c.env.CACHE
+  const key = `flight:${id}`
+
+  // Cache the base response (without observer) so all users share the same entry
+  let result = await kv.get(key, 'json') as any
+  if (!result) {
+    const api = new FlightRadar24API()
+    const raw = await api.getFlightDetails({ id } as Flight)
+    result = transformFlightDetail(raw)
+    c.executionCtx.waitUntil(kv.put(key, JSON.stringify(result), { expirationTtl: CACHE_TTL }))
+  }
+
+  // Compute per-request observer data on top of the cached result
+  if (observerLat !== undefined && observerLng !== undefined && result.telemetry) {
+    result = {
+      ...result,
+      ...computeObserver(observerLat, observerLng, result.telemetry.latitude, result.telemetry.longitude),
+    }
+  }
+
+  return c.json(result)
 })
+
+/**
+ * Compute aligned grid tiles that cover the given bounding box.
+ * Each tile is TILE_DEG × TILE_DEG degrees, snapped to a global grid.
+ * Overlapping requests from different users share cached tiles.
+ */
+function tileBounds(north: number, south: number, west: number, east: number) {
+  const tiles: { bounds: string; key: string }[] = []
+  const latStart = Math.floor(south / TILE_DEG) * TILE_DEG
+  const lngStart = Math.floor(west / TILE_DEG) * TILE_DEG
+
+  for (let lat = latStart; lat < north; lat += TILE_DEG) {
+    for (let lng = lngStart; lng < east; lng += TILE_DEG) {
+      const n = lat + TILE_DEG
+      const s = lat
+      const w = lng
+      const e = lng + TILE_DEG
+      tiles.push({
+        bounds: `${n},${s},${w},${e}`,
+        key: `tile:${n}:${s}:${w}:${e}`,
+      })
+    }
+  }
+  return tiles
+}
 
 app.post('/flights/nearby', async (c) => {
   let body: GeoJSONFeatureCollection
@@ -91,12 +143,44 @@ app.post('/flights/nearby', async (c) => {
     if (lng > maxLng) maxLng = lng
   }
 
-  // FlightRadar bounds: "north,south,west,east"
-  const bounds = `${maxLat},${minLat},${minLng},${maxLng}`
-
   try {
+    const kv = c.env.CACHE
     const api = new FlightRadar24API()
-    const allFlights = await api.getFlights(null, bounds)
+    const tiles = tileBounds(maxLat, minLat, minLng, maxLng)
+
+    let allFlights: any[]
+
+    if (tiles.length > MAX_TILES) {
+      // Very large area — single uncached request to avoid excessive FR24 calls
+      const bounds = `${maxLat},${minLat},${minLng},${maxLng}`
+      allFlights = await api.getFlights(null, bounds)
+    } else {
+      // Fetch tiles in parallel, each independently cached
+      const results = await Promise.all(
+        tiles.map(async ({ bounds, key }) => {
+          const cached = await kv.get(key, 'json') as any[] | null
+          if (cached) return cached
+
+          const flights = await api.getFlights(null, bounds)
+          c.executionCtx.waitUntil(
+            kv.put(key, JSON.stringify(flights), { expirationTtl: CACHE_TTL })
+          )
+          return flights
+        })
+      )
+
+      // Merge + deduplicate flights across tile boundaries
+      const seen = new Set<string>()
+      allFlights = []
+      for (const flights of results) {
+        for (const f of flights as any[]) {
+          if (!seen.has(f.id)) {
+            seen.add(f.id)
+            allFlights.push(f)
+          }
+        }
+      }
+    }
 
     // Filter to flights actually inside the polygon
     const flights = allFlights.filter((f: any) =>

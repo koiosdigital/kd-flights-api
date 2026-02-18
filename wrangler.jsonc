@@ -1,11 +1,25 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "kd-flights-api",
-  "main": "src/index.ts",
-  "compatibility_date": "2025-04-17",
-  "compatibility_flags": ["nodejs_compat"],
-  "workers_dev": false,
-  "rules": [
-    { "type": "Text", "globs": ["**/*.csv"] }
-  ]
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "kd-flights-api",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-04-17",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"workers_dev": false,
+	"rules": [
+		{
+			"type": "Text",
+			"globs": [
+				"**/*.csv"
+			]
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "CACHE",
+			"id": "26a6b2bf9b31490b935989da49bcdfbc",
+			"remote": true
+		}
+	],
 }
