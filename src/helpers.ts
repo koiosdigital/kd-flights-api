@@ -391,10 +391,11 @@ export function lookupCallsign(flight: Flight): {
 
   // Strip ICAO prefix from callsign to get the numeric flight number part
   const flightNumPart = callsign.slice(icao.length)
-  const flightNumber = `${airline.name} ${flightNumPart}`
+  const cleanName = airline.name.replace(/\s*\(.*?\)/g, '').trim()
+  const flightNumber = `${cleanName} ${flightNumPart}`
 
   return {
-    airlineName: airline.name,
+    airlineName: cleanName,
     flightNumber,
     logoUrl: `${LOGO_BASE}/${icao.toUpperCase()}.png`,
   }
@@ -573,11 +574,29 @@ function formatAltitude(alt: number): string {
   return `${alt.toLocaleString()} ft`
 }
 
+function formatGate(terminal: string | null, gate: string | null): string | null {
+  if (!gate && !terminal) return null
+  if (!gate) return terminal
+  if (!terminal) return gate
+  if (/^\d+$/.test(terminal)) return `${terminal}-${gate}`
+  return `${terminal}${gate}`
+}
+
+export interface PhaseContext {
+  originIata: string
+  destIata: string
+  originGate?: string | null
+  originTerminal?: string | null
+  destGate?: string | null
+  destTerminal?: string | null
+  actualDeparture?: number | null
+}
+
 export function inferPhaseFromTrail(
   analysis: TrailAnalysis,
-  originIata: string,
-  destIata: string,
+  ctx: PhaseContext,
 ): EnhancedPhaseResult {
+  const { originIata, destIata } = ctx
   const { current, verticalSpeed, acceleration, headingStable, stabilizedHeading, takeoffHeading } = analysis
   const { alt, spd, hd } = current
   const onGround = alt === 0
@@ -589,22 +608,30 @@ export function inferPhaseFromTrail(
     if (rwy && rwy.headingDelta <= 20) departureRunway = rwy
   }
 
+  // Gate string for origin / destination
+  const originGateStr = formatGate(ctx.originTerminal ?? null, ctx.originGate ?? null)
+  const destGateStr = formatGate(ctx.destTerminal ?? null, ctx.destGate ?? null)
+  // If the flight has an actual departure time, it already took off → ground = destination
+  const hasDeparted = !!ctx.actualDeparture
+
   // ── Ground states ──
   if (onGround) {
     if (spd <= 2) {
-      return { state: 'parked', label: 'Parked at gate', departureRunway }
+      const gate = hasDeparted ? destGateStr : originGateStr
+      const label = gate ? `At gate ${gate}` : 'At gate'
+      return { state: 'parked', label, departureRunway }
     }
     if (spd >= 30 && acceleration > 0.5 && headingStable) {
       const rwy = lookupRunway(originIata, stabilizedHeading ?? hd)
       const label = rwy && rwy.headingDelta <= 20
-        ? `Taking off from runway ${rwy.runway}`
+        ? `Taking off from ${rwy.runway}`
         : 'Taking off'
       return { state: 'takeoff_roll', label, runway: rwy ?? undefined, departureRunway }
     }
     if (spd >= 30 && acceleration <= 0) {
       const rwy = lookupRunway(destIata, hd)
       const label = rwy && rwy.headingDelta <= 20
-        ? `Landed on runway ${rwy.runway}`
+        ? `Landed on ${rwy.runway}`
         : 'Landed'
       return { state: 'landed', label, runway: rwy ?? undefined, departureRunway }
     }
@@ -614,7 +641,13 @@ export function inferPhaseFromTrail(
         ? { state: 'takeoff_roll', label: 'Taking off', departureRunway }
         : { state: 'landed', label: 'Landed', departureRunway }
     }
-    return { state: 'taxiing', label: 'Taxiing', departureRunway }
+    let taxiLabel = 'Taxiing'
+    if (hasDeparted && destGateStr) {
+      taxiLabel = `Taxiing to ${destGateStr}`
+    } else if (!hasDeparted && originGateStr) {
+      taxiLabel = `Taxiing from ${originGateStr}`
+    }
+    return { state: 'taxiing', label: taxiLabel, departureRunway }
   }
 
   // ── Airborne states ──
@@ -625,7 +658,7 @@ export function inferPhaseFromTrail(
     if (rwy && rwy.headingDelta <= 30) {
       return {
         state: 'final_approach',
-        label: `On final for runway ${rwy.runway}`,
+        label: `On final to ${rwy.runway}`,
         runway: rwy,
         departureRunway,
       }
@@ -635,9 +668,10 @@ export function inferPhaseFromTrail(
   // Approach: below 10k, descending toward destination
   if (alt <= 10000 && verticalSpeed < -300 && destIata) {
     const rwy = lookupRunway(destIata, hd)
+    const rwySuffix = rwy ? ` - ${rwy.runway}` : ''
     return {
       state: 'approach',
-      label: `Approaching ${destIata}`,
+      label: `Approaching ${destIata}${rwySuffix}`,
       ...(rwy ? { runway: rwy } : {}),
       departureRunway,
     }
@@ -797,7 +831,15 @@ export function transformFlightDetail(raw: any) {
   // ── Phase ──
   let phase: EnhancedPhaseResult = { state: 'cruising', label: 'Unknown' }
   if (analysis) {
-    phase = inferPhaseFromTrail(analysis, originIata, destIata)
+    phase = inferPhaseFromTrail(analysis, {
+      originIata,
+      destIata,
+      originGate: origin?.gate,
+      originTerminal: origin?.terminal,
+      destGate: destination?.gate,
+      destTerminal: destination?.terminal,
+      actualDeparture: actualDep,
+    })
   }
 
   return {
