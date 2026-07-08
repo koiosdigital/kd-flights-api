@@ -19,6 +19,8 @@ export type CloudflareBindings = {
     OIDC_ISSUER: string
     JWT_SHARED_SECRET: string
     PKI_ENCRYPTION_SECRET: string
+    // 64-byte (128 hex char) shared secret for HMAC-SHA256 request signing
+    REQUEST_SIGNING_SECRET: string
     db: D1Database
     CACHE: KVNamespace
 }

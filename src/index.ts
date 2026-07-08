@@ -8,6 +8,7 @@ import {
 import { transformFlightDetail, computeObserver } from './helpers'
 import { pointInPolygon, haversine } from './geojson'
 import { resolveUnitOptions, buildUnitsMeta, convertFlightResult, convertDistanceFromKm } from './units'
+import { verifySignature } from './signing'
 import openApiSpec from './openapi.yaml'
 
 const CACHE_TTL = 60  // seconds (KV minimum is 60)
@@ -22,6 +23,37 @@ app.use('*', cors({
   allowHeaders: ['X-Request-Signature', 'Content-Type'],
   allowMethods: ['GET', 'POST', 'OPTIONS']
 }))
+
+// HMAC-SHA256 request signing: clients must sign each /flights request with the
+// shared secret and pass the hex digest in X-Request-Signature.
+app.use('/flights/*', async (c, next) => {
+  const secret = c.env.REQUEST_SIGNING_SECRET
+  if (!secret) {
+    return c.json({ error: 'Request signing is not configured' }, 500)
+  }
+
+  // Never verify the CORS preflight — it carries no signature header.
+  if (c.req.method === 'OPTIONS') {
+    return next()
+  }
+
+  const provided = c.req.header('X-Request-Signature')
+  if (!provided) {
+    return c.json({ error: 'Missing X-Request-Signature header' }, 401)
+  }
+
+  const url = new URL(c.req.url)
+  const pathWithQuery = url.pathname + url.search
+  // Reading the body here caches it, so the route handler's c.req.json() still works.
+  const body = c.req.method === 'GET' ? '' : await c.req.text()
+
+  const valid = await verifySignature(secret, provided, c.req.method, pathWithQuery, body)
+  if (!valid) {
+    return c.json({ error: 'Invalid request signature' }, 401)
+  }
+
+  return next()
+})
 
 // Global error handler
 app.onError((err, c) => {
