@@ -1,26 +1,27 @@
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "kd-flights-api",
-	"main": "src/index.ts",
-	"compatibility_date": "2025-04-17",
-	"compatibility_flags": [
-		"nodejs_compat"
-	],
-	"workers_dev": false,
-	"rules": [
-		{
-			"type": "Text",
-			"globs": [
-				"**/*.csv",
-				"**/*.yaml"
-			]
-		}
-	],
-	"kv_namespaces": [
-		{
-			"binding": "CACHE",
-			"id": "26a6b2bf9b31490b935989da49bcdfbc",
-			"remote": true
-		}
-	],
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kd-flights-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-04-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "rules": [
+    {
+      "type": "Text",
+      "globs": ["**/*.csv", "**/*.yaml"],
+    },
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "CACHE",
+      "id": "26a6b2bf9b31490b935989da49bcdfbc",
+      "remote": true,
+    },
+  ],
+  "account_id": "9add4187b89e0aac0e5a951c893549dd",
+  "routes": [
+    { "pattern": "flights-api.koiosdigital.net", "custom_domain": true },
+  ],
+  "preview_urls": false,
+  "workers_dev": false,
 }
