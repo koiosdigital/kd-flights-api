@@ -34,12 +34,12 @@ export function buildUnitsMeta(opts: UnitOptions): UnitsMeta {
     system: opts.system,
     altitude: isMetric ? 'm' : 'ft',
     speed: opts.speedUnit === 'knots' ? 'kn'
-         : opts.speedUnit === 'miles' ? 'mph'
-         : 'km/h',
+      : opts.speedUnit === 'miles' ? 'mph'
+        : 'km/h',
     verticalSpeed: isMetric ? 'm/min' : 'ft/min',
     distance: opts.speedUnit === 'miles' ? 'mi'
-            : isMetric ? 'km'
-            : 'nm',
+      : isMetric ? 'km'
+        : 'nm',
   }
 }
 
@@ -76,8 +76,8 @@ export function convertSpeed(knots: number | null, opts: UnitOptions): number | 
   if (knots === null) return null
   switch (opts.speedUnit) {
     case 'kilometers': return Math.round(knotsToKmh(knots))
-    case 'miles':      return Math.round(knotsToMph(knots))
-    default:           return knots
+    case 'miles': return Math.round(knotsToMph(knots))
+    default: return knots
   }
 }
 
@@ -91,7 +91,7 @@ export function convertDistanceFromKm(km: number, opts: UnitOptions): number {
   switch (meta.distance) {
     case 'nm': return Math.round(kmToNm(km) * 10) / 10
     case 'mi': return Math.round(kmToMiles(km) * 10) / 10
-    default:   return Math.round(km * 10) / 10
+    default: return Math.round(km * 10) / 10
   }
 }
 
@@ -133,13 +133,13 @@ export function convertFlightResult(result: any, opts: UnitOptions): any {
 
     switch (result.phase.state) {
       case 'climbing':
-        result.phase.label = `Climbing through ${formattedAlt}`
+        result.phase.label = `Climbing, ${formattedAlt}`
         break
       case 'descending':
-        result.phase.label = `Descending through ${formattedAlt}`
+        result.phase.label = `Descending, ${formattedAlt}`
         break
       case 'cruising':
-        result.phase.label = `Cruising at ${formattedAlt}`
+        result.phase.label = `Cruising, ${formattedAlt}`
         break
     }
   }

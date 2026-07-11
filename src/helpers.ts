@@ -575,7 +575,7 @@ export interface EnhancedPhaseResult {
 
 function formatAltitude(alt: number): string {
   if (alt >= 18000) return `FL${Math.round(alt / 100)}`
-  return `${alt.toLocaleString()} ft`
+  return `${alt.toLocaleString()}`
 }
 
 function formatGate(terminal: string | null, gate: string | null): string | null {
@@ -695,7 +695,7 @@ export function inferPhaseFromTrail(
   if (verticalSpeed > 300) {
     return {
       state: 'climbing',
-      label: `Climbing through ${formatAltitude(alt)}`,
+      label: `Climbing, ${formatAltitude(alt)}`,
       altitudeRaw: alt,
       departureRunway,
     }
@@ -705,7 +705,7 @@ export function inferPhaseFromTrail(
   if (verticalSpeed < -300) {
     return {
       state: 'descending',
-      label: `Descending through ${formatAltitude(alt)}`,
+      label: `Descending, ${formatAltitude(alt)}`,
       altitudeRaw: alt,
       departureRunway,
     }
@@ -714,7 +714,7 @@ export function inferPhaseFromTrail(
   // Cruising
   return {
     state: 'cruising',
-    label: `Cruising at ${formatAltitude(alt)}`,
+    label: `Cruising, ${formatAltitude(alt)}`,
     altitudeRaw: alt,
     departureRunway,
   }
@@ -755,6 +755,13 @@ export function transformFlightDetail(raw: any) {
   if (flightNumber && iata && flightNumber.startsWith(iata)) {
     displayName = `${airlineName} ${flightNumber.slice(iata.length)}`
   }
+
+  //Format the display name, removing any parenthetical livery info and "Airline" suffixes
+  displayName = displayName
+    .replace(/\s*\((?=[^)]*livery)[^)]*\)/ig, '')
+    .replace(/\bAir\s*Lines?\b/ig, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
 
   // ── Aircraft ──
   const aircraft = raw.aircraft ?? {}
