@@ -395,7 +395,7 @@ export function lookupCallsign(flight: Flight): {
   const flightNumber = `${cleanName} ${flightNumPart}`
 
   return {
-    airlineName: cleanName,
+    airlineName: cleanName.replace(/\bAir\s*Lines?\b/ig, '').replace(/\s{2,}/g, ' ').trim(),
     flightNumber,
     logoUrl: `${LOGO_BASE}/${icao.toUpperCase()}.png`,
   }
