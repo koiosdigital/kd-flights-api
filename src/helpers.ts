@@ -395,7 +395,11 @@ export function lookupCallsign(flight: Flight): {
   const flightNumber = `${cleanName} ${flightNumPart}`
 
   return {
-    airlineName: cleanName.replace(/\bAir\s*Lines?\b/ig, '').replace(/\s{2,}/g, ' ').trim(),
+    airlineName: cleanName
+      .replace(/\s*\((?=[^)]*livery)[^)]*\)/ig, '')
+      .replace(/\bAir\s*Lines?\b/ig, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim(),
     flightNumber,
     logoUrl: `${LOGO_BASE}/${icao.toUpperCase()}.png`,
   }
@@ -518,13 +522,13 @@ export function computeBearing(lat1: number, lng1: number, lat2: number, lng2: n
   const dLng = toRad(lng2 - lng1)
   const y = Math.sin(dLng) * Math.cos(toRad(lat2))
   const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2))
-          - Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLng)
+    - Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLng)
   return ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360
 }
 
 function cardinalDirection(bearing: number): string {
-  const dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE',
-                'S','SSW','SW','WSW','W','WNW','NW','NNW']
+  const dirs = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+    'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
   return dirs[Math.round(bearing / 22.5) % 16]
 }
 
