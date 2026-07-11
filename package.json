@@ -7,7 +7,6 @@
   },
   "dependencies": {
     "@types/node": "^25.3.3",
-    "flightradarapi": "^1.4.0",
     "hono": "^4.12.5",
     "jose": "^6.1.3",
     "zod": "^4.3.6"
@@ -22,9 +21,6 @@
       "esbuild",
       "sharp",
       "workerd"
-    ],
-    "patchedDependencies": {
-      "flightradarapi@1.4.0": "patches/flightradarapi@1.4.0.patch"
-    }
+    ]
   }
 }

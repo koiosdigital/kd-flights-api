@@ -1,4 +1,3 @@
-import { Flight } from 'flightradarapi'
 import airlinesRaw from '../data/airlines.csv'
 import airportsRaw from '../data/airports-slim.csv'
 import runwaysRaw from '../data/runways-slim.csv'
@@ -103,6 +102,12 @@ function getAirlines(): Map<string, Airline> {
     airlinesByIcao = parseAirlinesCsv(airlinesRaw)
   }
   return airlinesByIcao
+}
+
+/** Resolve an ICAO airline designator (e.g. `AAL`) to its record, or null. */
+export function airlineByIcao(icao: string): Airline | null {
+  if (!icao) return null
+  return getAirlines().get(icao.toUpperCase()) ?? null
 }
 
 function parseAirportsCsv(csv: string): Map<string, string> {
@@ -365,45 +370,6 @@ export function inferFlightPhase(input: FlightPhaseInput): FlightPhaseResult {
   return result
 }
 
-/**
- * Takes a callsign like "AAL1234" and returns the airline name,
- * flight number, and carrier logo URL.
- */
-export function lookupCallsign(flight: Flight): {
-  airlineName: string
-  flightNumber: string
-  logoUrl: string
-} | null {
-  const callsign = flight.callsign?.trim()
-  if (!callsign || callsign.length < 4) return null
-
-  // ICAO callsigns: 3-letter airline prefix + numeric flight number
-  const icao = flight.airlineIcao;
-
-  const airlines = getAirlines()
-  const airline = airlines.get(icao)
-
-  if (!airline) return {
-    airlineName: icao,
-    flightNumber: callsign,
-    logoUrl: `${LOGO_BASE}/generic.png`,
-  }
-
-  // Strip ICAO prefix from callsign to get the numeric flight number part
-  const flightNumPart = callsign.slice(icao.length)
-  const cleanName = airline.name.replace(/\s*\(.*?\)/g, '').trim()
-  const flightNumber = `${cleanName} ${flightNumPart}`
-
-  return {
-    airlineName: cleanName
-      .replace(/\s*\((?=[^)]*livery)[^)]*\)/ig, '')
-      .replace(/\bAir\s*Lines?\b/ig, '')
-      .replace(/\s{2,}/g, ' ')
-      .trim(),
-    flightNumber,
-    logoUrl: `${LOGO_BASE}/${icao.toUpperCase()}.png`,
-  }
-}
 
 // ── Trail analysis ──────────────────────────────────────────────────
 

@@ -1,19 +1,26 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import { Flight, FlightRadar24API } from 'flightradarapi'
 import {
   type CloudflareBindings,
   type GeoJSONFeatureCollection,
 } from './types'
 import { transformFlightDetail, computeObserver } from './helpers'
+import { buildRawDetail, buildRawFromLive } from './adapt'
 import { pointInPolygon, haversine } from './geojson'
 import { resolveUnitOptions, buildUnitsMeta, convertFlightResult, convertDistanceFromKm } from './units'
 import { verifySignature } from './signing'
+import {
+  liveFeed,
+  flightDetails,
+  type BoundingBox,
+  type LiveFlight,
+  type FlightDetailsResult,
+} from './grpc'
 import openApiSpec from './openapi.yaml'
 
-const CACHE_TTL = 60  // seconds (KV minimum is 60)
-const TILE_DEG = 5    // degrees per grid tile
-const MAX_TILES = 12  // cap parallel FR24 calls for large viewports
+const CACHE_TTL = 60          // seconds — shared "fresh" cache (KV minimum is 60)
+const LAST_GOOD_TTL = 86400   // seconds — stale-while-error fallback window
+const WORLD: BoundingBox = { north: 90, south: -90, west: -180, east: 180 }
 
 const app = new Hono<{ Bindings: CloudflareBindings }>()
 
@@ -68,13 +75,34 @@ app.get('/swagger.yaml', (c) => {
 
 app.get('/health', (c) => c.json({ status: 'ok' }))
 
+/** Retry an async op a few times; returns null if every attempt throws/empties. */
+async function withRetry<T>(fn: () => Promise<T | null>, attempts = 3): Promise<T | null> {
+  let lastErr: unknown = null
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await fn()
+      if (r !== null) return r
+    } catch (e) {
+      lastErr = e
+    }
+  }
+  if (lastErr) console.log('withRetry exhausted:', String(lastErr))
+  return null
+}
+
 app.get('/flights/:id', async (c) => {
   const id = c.req.param('id')
   if (!id) {
     return c.json({ error: 'Missing id parameter' }, 400)
   }
 
-  // Optional observer coordinates for bearing computation
+  // FR24 flight ids are hex; the gRPC API wants the base-10 fixed32.
+  const flightIdNum = parseInt(id, 16)
+  if (!Number.isFinite(flightIdNum) || flightIdNum <= 0) {
+    return c.json({ error: 'Invalid flight id' }, 400)
+  }
+
+  // Optional observer coordinates for bearing/distance computation
   const latParam = c.req.query('lat')
   const lngParam = c.req.query('lng')
   const observerLat = latParam ? parseFloat(latParam) : undefined
@@ -87,22 +115,51 @@ app.get('/flights/:id', async (c) => {
     return c.json({ error: 'lat and lng must be valid numbers' }, 400)
   }
 
-  // Unit options
   const unitOpts = resolveUnitOptions(c.req.query('unit'), c.req.query('speed_unit'))
 
   const kv = c.env.CACHE
   const key = `flight:${id}`
+  const lastGoodKey = `flight-lg:${id}`
 
-  // Cache the base response (without observer) so all users share the same entry
+  // Base result (without observer) is shared across all users/units.
   let result = await kv.get(key, 'json') as any
   if (!result) {
-    const api = new FlightRadar24API()
-    const raw = await api.getFlightDetails({ id } as Flight)
-    result = transformFlightDetail(raw)
-    c.executionCtx.waitUntil(kv.put(key, JSON.stringify(result), { expirationTtl: CACHE_TTL }))
+    result = await withRetry(async () => {
+      // FlightDetails carries everything except the plain IATA origin/destination
+      // codes; a selected-id LiveFeed query is the only source for those.
+      const [detail, feed] = await Promise.all([
+        flightDetails(flightIdNum),
+        liveFeed({ bbox: WORLD, selectedIds: [flightIdNum] }),
+      ])
+      const route: LiveFlight | null = feed.selected[0] ?? null
+      if (detail) {
+        const raw = buildRawDetail(id, detail as FlightDetailsResult, route)
+        return transformFlightDetail(raw)
+      }
+      // No FlightDetails (e.g. general-aviation aircraft) — fall back to the live
+      // position so the display shows reg/type/telemetry instead of blanking.
+      if (route) {
+        return transformFlightDetail(buildRawFromLive(id, route))
+      }
+      return null
+    })
+
+    if (result) {
+      c.executionCtx.waitUntil(Promise.all([
+        kv.put(key, JSON.stringify(result), { expirationTtl: CACHE_TTL }),
+        kv.put(lastGoodKey, JSON.stringify(result), { expirationTtl: LAST_GOOD_TTL }),
+      ]))
+    } else {
+      // Stale-while-error: FR24 momentarily failed — serve the last good detail
+      // rather than a 500, so the display never blanks for a live flight.
+      result = await kv.get(lastGoodKey, 'json') as any
+      if (!result) {
+        return c.json({ error: 'Flight not found or not live' }, 404)
+      }
+    }
   }
 
-  // Compute per-request observer data on top of the cached result
+  // Per-request observer data on top of the shared base result
   if (observerLat !== undefined && observerLng !== undefined && result.telemetry) {
     result = {
       ...result,
@@ -110,37 +167,12 @@ app.get('/flights/:id', async (c) => {
     }
   }
 
-  // Apply unit conversion and attach units metadata
+  // Unit conversion + units metadata
   result = convertFlightResult(result, unitOpts)
   result.units = buildUnitsMeta(unitOpts)
 
   return c.json(result)
 })
-
-/**
- * Compute aligned grid tiles that cover the given bounding box.
- * Each tile is TILE_DEG × TILE_DEG degrees, snapped to a global grid.
- * Overlapping requests from different users share cached tiles.
- */
-function tileBounds(north: number, south: number, west: number, east: number) {
-  const tiles: { bounds: string; key: string }[] = []
-  const latStart = Math.floor(south / TILE_DEG) * TILE_DEG
-  const lngStart = Math.floor(west / TILE_DEG) * TILE_DEG
-
-  for (let lat = latStart; lat < north; lat += TILE_DEG) {
-    for (let lng = lngStart; lng < east; lng += TILE_DEG) {
-      const n = lat + TILE_DEG
-      const s = lat
-      const w = lng
-      const e = lng + TILE_DEG
-      tiles.push({
-        bounds: `${n},${s},${w},${e}`,
-        key: `tile:${n}:${s}:${w}:${e}`,
-      })
-    }
-  }
-  return tiles
-}
 
 app.post('/flights/nearby', async (c) => {
   const unitOpts = resolveUnitOptions(c.req.query('unit'), c.req.query('speed_unit'))
@@ -170,7 +202,7 @@ app.post('/flights/nearby', async (c) => {
   const rings = polygonFeature.geometry.coordinates as number[][][]
   const outerRing = rings[0]
 
-  // Compute bounding box from polygon [lng, lat] pairs
+  // Bounding box from polygon [lng, lat] pairs
   let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity
   for (const [lng, lat] of outerRing) {
     if (lat < minLat) minLat = lat
@@ -178,93 +210,78 @@ app.post('/flights/nearby', async (c) => {
     if (lng < minLng) minLng = lng
     if (lng > maxLng) maxLng = lng
   }
+  const bbox: BoundingBox = { north: maxLat, south: minLat, west: minLng, east: maxLng }
 
-  try {
-    const kv = c.env.CACHE
-    const api = new FlightRadar24API()
-    const tiles = tileBounds(maxLat, minLat, minLng, maxLng)
+  // A single gRPC LiveFeed call covers the whole viewport (no tiling needed):
+  // the endpoint returns up to `limit` flights and is reliable, unlike the old
+  // JSON feed. Cache the raw flight list per bbox so bursts of device renders
+  // share one upstream call, and keep a stale-while-error copy.
+  const bboxKey = `feed:${maxLat.toFixed(2)}:${minLat.toFixed(2)}:${minLng.toFixed(2)}:${maxLng.toFixed(2)}`
+  const lastGoodKey = `feed-lg:${bboxKey}`
 
-    let allFlights: any[]
+  const kv = c.env.CACHE
+  let allFlights = await kv.get(bboxKey, 'json') as LiveFlight[] | null
 
-    if (tiles.length > MAX_TILES) {
-      // Very large area — single uncached request to avoid excessive FR24 calls
-      const bounds = `${maxLat},${minLat},${minLng},${maxLng}`
-      allFlights = await api.getFlights(null, bounds)
+  if (!allFlights) {
+    const feed = await withRetry(async () => {
+      const r = await liveFeed({ bbox })
+      return r.flights.length > 0 ? r.flights : null
+    })
+    if (feed) {
+      allFlights = feed
+      c.executionCtx.waitUntil(Promise.all([
+        kv.put(bboxKey, JSON.stringify(feed), { expirationTtl: CACHE_TTL }),
+        kv.put(lastGoodKey, JSON.stringify(feed), { expirationTtl: LAST_GOOD_TTL }),
+      ]))
     } else {
-      // Fetch tiles in parallel, each independently cached
-      const results = await Promise.all(
-        tiles.map(async ({ bounds, key }) => {
-          const cached = await kv.get(key, 'json') as any[] | null
-          if (cached) return cached
-
-          const flights = await api.getFlights(null, bounds)
-          c.executionCtx.waitUntil(
-            kv.put(key, JSON.stringify(flights), { expirationTtl: CACHE_TTL })
-          )
-          return flights
-        })
-      )
-
-      // Merge + deduplicate flights across tile boundaries
-      const seen = new Set<string>()
-      allFlights = []
-      for (const flights of results) {
-        for (const f of flights as any[]) {
-          if (!seen.has(f.id)) {
-            seen.add(f.id)
-            allFlights.push(f)
-          }
-        }
-      }
+      // Stale-while-error rather than returning an empty list.
+      allFlights = await kv.get(lastGoodKey, 'json') as LiveFlight[] | null
     }
-
-    // Filter to flights actually inside the polygon
-    const flights = allFlights.filter((f: any) =>
-      pointInPolygon(f.longitude, f.latitude, outerRing)
-    )
-
-    // Blocked callsigns sort to the bottom
-    const isBlocked = (cs: string | null) =>
-      !cs || /^x{3,}$/i.test(cs) || /blocked/i.test(cs)
-
-    // Sort by distance to point if provided, otherwise by callsign
-    if (pointFeature) {
-      const [pLng, pLat] = pointFeature.geometry.coordinates as number[]
-      flights.sort((a: any, b: any) => {
-        const aBlocked = isBlocked(a.callsign)
-        const bBlocked = isBlocked(b.callsign)
-        if (aBlocked !== bBlocked) return aBlocked ? 1 : -1
-        return haversine(pLat, pLng, a.latitude, a.longitude) - haversine(pLat, pLng, b.latitude, b.longitude)
-      })
-    } else {
-      flights.sort((a: any, b: any) => {
-        const aBlocked = isBlocked(a.callsign)
-        const bBlocked = isBlocked(b.callsign)
-        if (aBlocked !== bBlocked) return aBlocked ? 1 : -1
-        return (a.callsign || '').localeCompare(b.callsign || '')
-      })
-    }
-
-    return c.json(flights.map((f: any) => ({
-      id: f.id,
-      callsign: f.callsign,
-      latitude: f.latitude,
-      longitude: f.longitude,
-      ...(pointFeature ? {
-        distance: convertDistanceFromKm(
-          haversine(
-            (pointFeature.geometry.coordinates as number[])[1],
-            (pointFeature.geometry.coordinates as number[])[0],
-            f.latitude,
-            f.longitude,
-          ),
-          unitOpts,
-        ),
-      } : {}),
-    })))
-  } catch (err) {
-    return c.json(err, 500)
   }
+
+  if (!allFlights) return c.json([])
+
+  // Filter to flights actually inside the polygon
+  const flights = allFlights.filter((f) => pointInPolygon(f.lon, f.lat, outerRing))
+
+  // Blocked callsigns sort to the bottom
+  const isBlocked = (cs: string | null) =>
+    !cs || /^x{3,}$/i.test(cs) || /blocked/i.test(cs)
+
+  if (pointFeature) {
+    const [pLng, pLat] = pointFeature.geometry.coordinates as number[]
+    flights.sort((a, b) => {
+      const aBlocked = isBlocked(a.callsign)
+      const bBlocked = isBlocked(b.callsign)
+      if (aBlocked !== bBlocked) return aBlocked ? 1 : -1
+      return haversine(pLat, pLng, a.lat, a.lon) - haversine(pLat, pLng, b.lat, b.lon)
+    })
+  } else {
+    flights.sort((a, b) => {
+      const aBlocked = isBlocked(a.callsign)
+      const bBlocked = isBlocked(b.callsign)
+      if (aBlocked !== bBlocked) return aBlocked ? 1 : -1
+      return (a.callsign || '').localeCompare(b.callsign || '')
+    })
+  }
+
+  return c.json(flights.map((f) => ({
+    id: f.hexId,
+    callsign: f.callsign,
+    latitude: f.lat,
+    longitude: f.lon,
+    ...(pointFeature ? {
+      distance: convertDistanceFromKm(
+        haversine(
+          (pointFeature.geometry.coordinates as number[])[1],
+          (pointFeature.geometry.coordinates as number[])[0],
+          f.lat,
+          f.lon,
+        ),
+        unitOpts,
+      ),
+    } : {}),
+  })))
 })
 
 export default app
