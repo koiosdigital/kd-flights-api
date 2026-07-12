@@ -48,10 +48,19 @@ async function fetchSurface(lat: number, lng: number): Promise<AirportSurface | 
     `node[aeroway=gate][ref](around:${SEARCH_RADIUS_M},${lat},${lng}););out geom;`
   const res = await fetch(OVERPASS_URL, {
     method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      accept: 'application/json',
+      // Overpass rejects UA-less requests (406) and its usage policy asks for
+      // an identifying agent. Workers send no default User-Agent.
+      'user-agent': 'koios-flights-api/1.0 (https://flights-api.koiosdigital.net)',
+    },
     body: `data=${encodeURIComponent(query)}`,
   })
-  if (!res.ok) return null
+  if (!res.ok) {
+    console.log(`overpass HTTP ${res.status}`)
+    return null
+  }
   const json = await res.json() as {
     elements?: {
       type: string
@@ -96,8 +105,12 @@ export async function getAirportSurface(
   ctx.waitUntil((async () => {
     if (await kv.get(lockKey(icao))) return // a recent attempt is in flight / just failed
     await kv.put(lockKey(icao), '1', { expirationTtl: FETCH_LOCK_TTL })
-    const surface = await fetchSurface(lat, lng).catch(() => null)
+    const surface = await fetchSurface(lat, lng).catch((e) => {
+      console.log(`surface fetch threw for ${icao}:`, String(e))
+      return null
+    })
     if (surface) {
+      console.log(`surface cached for ${icao}: ${surface.taxiways.length} taxiways, ${surface.gates.length} gates`)
       await kv.put(surfaceKey(icao), JSON.stringify(surface), { expirationTtl: SURFACE_TTL })
     }
   })())
@@ -139,12 +152,17 @@ export function nearestTaxiway(
   return best
 }
 
-/** Named gate stand within `maxM` of the parked position. */
+/**
+ * Named gate stand within `maxM` of the parked position. OSM gate nodes sit at
+ * the jet bridge / terminal wall while the ADS-B position is the aircraft's
+ * GPS antenna, so the own-gate distance runs 40–90 m for large types; 100 m
+ * keeps those matched while nearest-node still separates adjacent gates.
+ */
 export function nearestGate(
   surface: AirportSurface,
   lat: number,
   lng: number,
-  maxM = 60,
+  maxM = 100,
 ): string | null {
   let best: string | null = null
   let bestD = maxM
