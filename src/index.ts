@@ -4,7 +4,7 @@ import {
   type CloudflareBindings,
   type GeoJSONFeatureCollection,
 } from './types'
-import { transformFlightDetail, computeObserver } from './helpers'
+import { transformFlightDetail, computeObserver, airlineIcaosForIata } from './helpers'
 import { buildRawDetail, buildRawFromLive } from './adapt'
 import { pointInPolygon, haversine } from './geojson'
 import { resolveUnitOptions, buildUnitsMeta, convertFlightResult, convertDistanceFromKm } from './units'
@@ -13,6 +13,7 @@ import {
   liveFeed,
   flightDetails,
   searchFlights,
+  liveFlightsByAirline,
   type BoundingBox,
   type LiveFlight,
   type FlightDetailsResult,
@@ -34,8 +35,14 @@ app.use('*', cors({
 }))
 
 // HMAC-SHA256 request signing: clients must sign each /flights request with the
-// shared secret and pass the hex digest in X-Request-Signature.
+// shared secret and pass the hex digest in X-Request-Signature. Enforcement is
+// gated on the ENFORCE_SIGNATURE var — anything but "true" lets requests
+// through unverified.
 app.use('/flights/*', async (c, next) => {
+  if (String(c.env.ENFORCE_SIGNATURE).toLowerCase() !== 'true') {
+    return next()
+  }
+
   const secret = c.env.REQUEST_SIGNING_SECRET
   if (!secret) {
     return c.json({ error: 'Request signing is not configured' }, 500)
@@ -93,26 +100,85 @@ async function withRetry<T>(fn: () => Promise<T | null>, attempts = 3): Promise<
 }
 
 /**
+ * Live prefix matching for the typeahead. FR24's `flights_list`/`callsigns_list`
+ * filters are exact-match only, so for partial input (`UA96`) we parse off the
+ * airline designator, pull that airline's live fleet via the airline filter, and
+ * prefix-match here — against the IATA number for `UA96`-style queries (which
+ * also catches regional feeders like `SKW5328` = `UA5328`) and against the
+ * callsign for `UAL96`-style queries.
+ */
+async function prefixSearchLive(q: string, limit: number): Promise<LiveFlight[]> {
+  const m = q.match(/^([A-Z0-9]{2}|[A-Z]{3})(\d{0,4}[A-Z]?)$/)
+  if (!m || /^\d+$/.test(m[1])) return []
+  const code = m[1]
+  const icaos = code.length === 3 ? [code] : airlineIcaosForIata(code)
+  if (icaos.length === 0) return []
+
+  const fleets = await Promise.all(icaos.map((icao) => liveFlightsByAirline(icao).catch(() => [])))
+  const matches = fleets.flat().filter(
+    (f) => f.flightNumber.startsWith(q) || f.callsign.startsWith(q),
+  )
+  // Shortest flight number first so UA96 ranks before UA960 while typing
+  matches.sort((a, b) => {
+    const ka = a.flightNumber || a.callsign
+    const kb = b.flightNumber || b.callsign
+    return ka.length - kb.length || ka.localeCompare(kb)
+  })
+  return matches.slice(0, limit)
+}
+
+/**
+ * Normalize a picker query: trim, uppercase, and strip separators so `ua 962` /
+ * `UA-962` match feed values. Also handles a selected flight — the config host
+ * then stores the whole option (`{display, text, value}`) and echoes that JSON
+ * back as the query, so we extract `value` first (before upper-casing, to keep
+ * the JSON keys intact).
+ */
+function normalizeSearchQuery(raw: string): string {
+  let s = raw.trim()
+  if (s.startsWith('{')) {
+    try {
+      const o = JSON.parse(s) as { value?: unknown }
+      if (typeof o.value === 'string') s = o.value
+    } catch {
+      // not JSON — treat as raw typed text
+    }
+  }
+  return s.trim().toUpperCase().replace(/[\s-]+/g, '')
+}
+
+/**
  * Flight-number search for the config picker/typeahead. `query` accepts an IATA
- * flight number (`UA962`) or ICAO callsign (`UAL962`). Returns currently-live
- * matches shaped for a picker: `{ value, display, callsign, route }`, where
- * `value` is the FR24 hex id the client tracks.
+ * flight number (`UA962`) or ICAO callsign (`UAL962`), full or partial. Returns
+ * currently-live matches shaped for a picker: `{ value, display, callsign,
+ * route }`, where `value` is the callsign the client tracks.
  */
 app.get('/flights/search', async (c) => {
-  const query = (c.req.query('query') ?? c.req.query('q') ?? '').trim()
+  const query = normalizeSearchQuery(c.req.query('query') ?? c.req.query('q') ?? '')
   if (query.length < 2) {
     return c.json({ results: [] })
   }
 
-  const matches = await searchFlights(query, 20).catch(() => [])
-
+  // Exact filter search catches anything the prefix path can't parse
+  const [exact, prefix] = await Promise.all([
+    searchFlights(query, 20).catch(() => []),
+    prefixSearchLive(query, 20).catch(() => []),
+  ])
+  const seen = new Set<number>()
+  const matches = [...exact, ...prefix]
+    .filter((f) => (seen.has(f.flightid) ? false : (seen.add(f.flightid), true)))
+    .slice(0, 20)
+  console.log(`search(${query}): ${exact.length} exact + ${prefix.length} prefix -> ${matches.length}`)
   const results = matches
     .filter((f) => f.callsign) // skip anonymous/blocked entries
     .map((f) => {
       const from = lookupAirport(f.from)
       const to = lookupAirport(f.to)
       const route = f.from && f.to ? `${f.from} → ${f.to}` : ''
-      const parts = [f.callsign]
+      const title = f.flightNumber && f.flightNumber !== f.callsign
+        ? `${f.flightNumber} (${f.callsign})`
+        : f.callsign
+      const parts = [title]
       if (route) parts.push(route)
       if (f.type) parts.push(f.type)
       return {
@@ -121,6 +187,7 @@ app.get('/flights/search', async (c) => {
         value: f.callsign,
         display: parts.join('  ·  '),
         callsign: f.callsign,
+        flightNumber: f.flightNumber || null,
         id: f.hexId,
         registration: f.reg || null,
         type: f.type || null,

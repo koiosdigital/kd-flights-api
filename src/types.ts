@@ -21,6 +21,8 @@ export type CloudflareBindings = {
     PKI_ENCRYPTION_SECRET: string
     // 64-byte (128 hex char) shared secret for HMAC-SHA256 request signing
     REQUEST_SIGNING_SECRET: string
+    // "true" to require X-Request-Signature on /flights routes; anything else skips verification
+    ENFORCE_SIGNATURE?: string
     db: D1Database
     CACHE: KVNamespace
 }

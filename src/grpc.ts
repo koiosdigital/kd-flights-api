@@ -246,6 +246,8 @@ export interface LiveFlight {
   speed: number
   onGround: boolean
   callsign: string
+  /** IATA flight number (e.g. `UA962`); differs from callsign for regional feeders. */
+  flightNumber: string
   timestampMs: number
   reg: string
   type: string
@@ -259,8 +261,9 @@ function parseFlight(m: Map<number, DecodedField[]>): LiveFlight {
   // _common.Flight
   const flightid = getInt(m, 1)
   const extra = getMessage(m, 13) // ExtraFlightInfo
-  let reg = '', type = '', from = '', to = '', vspeed = 0, eta = 0
+  let flightNumber = '', reg = '', type = '', from = '', to = '', vspeed = 0, eta = 0
   if (extra) {
+    flightNumber = getString(extra, 1)
     reg = getString(extra, 2)
     type = getString(extra, 4)
     vspeed = getInt(extra, 6)
@@ -284,6 +287,7 @@ function parseFlight(m: Map<number, DecodedField[]>): LiveFlight {
     speed: getInt(m, 6),
     onGround: getBool(m, 10),
     callsign: getString(m, 11),
+    flightNumber,
     timestampMs: tsMs,
     reg,
     type,
@@ -388,15 +392,38 @@ export async function searchFlights(query: string, limit = 20): Promise<LiveFlig
     feedWithFilter(new Writer().stringField(8, q), limit).catch(() => []),
   ])
 
+  return dedupeById([...byCallsign, ...byNumber]).slice(0, limit)
+}
+
+function dedupeById(flights: LiveFlight[]): LiveFlight[] {
   const seen = new Set<number>()
   const out: LiveFlight[] = []
-  for (const flight of [...byCallsign, ...byNumber]) {
+  for (const flight of flights) {
     if (!seen.has(flight.flightid)) {
       seen.add(flight.flightid)
       out.push(flight)
     }
   }
-  return out.slice(0, limit)
+  return out
+}
+
+/**
+ * All live flights for an airline by ICAO designator (e.g. `UAL`). Queries the
+ * `airlines_list` filter (`AirlineFilter { icao = 1, type = 2 }`) as both
+ * PAINTED_AS (0) and OPERATED_AS (1) and merges: painted-as captures regional
+ * feeders flying the airline's IATA numbers under their own callsigns
+ * (`SKW5328` = `UA5328`), operated-as captures the reverse.
+ */
+export async function liveFlightsByAirline(icao: string, limit = 1500): Promise<LiveFlight[]> {
+  const code = icao.trim().toUpperCase()
+  if (!code) return []
+  const byType = (type: number) =>
+    feedWithFilter(
+      new Writer().messageField(3, new Writer().stringField(1, code).varintField(2, type)),
+      limit,
+    ).catch(() => [])
+  const [painted, operated] = await Promise.all([byType(0), byType(1)])
+  return dedupeById([...painted, ...operated])
 }
 
 export async function liveFeed(opts: {

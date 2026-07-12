@@ -321,7 +321,15 @@ components:
             - landed
         label:
           type: string
-          description: Human-readable phase description, e.g. "Cruising at FL350".
+          description: >
+            Human-readable phase description, e.g. "Cruising at FL350".
+            Ground labels distinguish gate/taxi sub-states from the track:
+            "At gate C23", "Pushing back", "Taxiing", "Holding" (stopped after
+            leaving the gate, e.g. a deice pad or runway queue), "Lining up
+            runway 28C", "On runway 28C", "Crossing runway 10C" (all state
+            `taxiing`), then "Taking off from 10L" / "Landed on 27L".
+            Runway occupancy labels come from a position test against runway
+            geometry where OurAirports has threshold coordinates.
         departureRunway:
           $ref: "#/components/schemas/RunwayInfo"
         runway:

@@ -5,6 +5,10 @@
   "compatibility_date": "2025-04-17",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": false,
+  "vars": {
+    // Set to "true" to require the X-Request-Signature HMAC on /flights routes
+    "ENFORCE_SIGNATURE": "false",
+  },
   "rules": [
     {
       "type": "Text",

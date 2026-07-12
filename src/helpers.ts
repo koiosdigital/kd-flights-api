@@ -10,6 +10,7 @@ interface Airline {
   name: string
   iata: string | null
   icao: string
+  active: boolean
 }
 
 interface Runway {
@@ -17,6 +18,14 @@ interface Runway {
   heading: number      // true heading in degrees
   lengthFt: number | null
   surface: string | null
+  lat: number | null   // threshold latitude (null when OurAirports lacks it)
+  lon: number | null
+}
+
+interface RunwayPair {
+  le: Runway
+  he: Runway
+  widthFt: number | null
 }
 
 interface RunwayResult {
@@ -33,7 +42,7 @@ let airlinesByIcao: Map<string, Airline> | null = null
 // Airport code (IATA/ICAO) → OurAirports ident
 let airportCodeToIdent: Map<string, string> | null = null
 // OurAirports ident → list of runway ends
-let runwaysByAirport: Map<string, { le: Runway; he: Runway }[]> | null = null
+let runwaysByAirport: Map<string, RunwayPair[]> | null = null
 
 function parseAirlinesCsv(csv: string): Map<string, Airline> {
   const map = new Map<string, Airline>()
@@ -52,7 +61,7 @@ function parseAirlinesCsv(csv: string): Map<string, Airline> {
 
     if (!icao) continue
 
-    map.set(icao, { name, iata, icao })
+    map.set(icao, { name, iata, icao, active: fields[7] === 'Y' })
   }
 
   return map
@@ -110,6 +119,29 @@ export function airlineByIcao(icao: string): Airline | null {
   return getAirlines().get(icao.toUpperCase()) ?? null
 }
 
+// IATA designator → airlines sharing it (IATA codes are recycled, so several
+// mostly-defunct carriers can share one)
+let airlinesByIata: Map<string, Airline[]> | null = null
+
+/**
+ * Resolve an IATA airline designator (e.g. `UA`) to ICAO designators (`UAL`).
+ * Prefers active carriers; returns at most 3 candidates.
+ */
+export function airlineIcaosForIata(iata: string): string[] {
+  if (!airlinesByIata) {
+    airlinesByIata = new Map()
+    for (const airline of getAirlines().values()) {
+      if (!airline.iata) continue
+      const list = airlinesByIata.get(airline.iata)
+      if (list) list.push(airline)
+      else airlinesByIata.set(airline.iata, [airline])
+    }
+  }
+  const list = airlinesByIata.get(iata.toUpperCase()) ?? []
+  const active = list.filter((a) => a.active)
+  return (active.length ? active : list).slice(0, 3).map((a) => a.icao)
+}
+
 function parseAirportsCsv(csv: string): Map<string, string> {
   const map = new Map<string, string>()
   const lines = csv.split('\n')
@@ -145,25 +177,35 @@ function headingFromDesignator(designator: string): number | null {
   return num === 36 ? 360 : num * 10
 }
 
-function parseRunwaysCsv(csv: string): Map<string, { le: Runway; he: Runway }[]> {
-  const map = new Map<string, { le: Runway; he: Runway }[]>()
+function parseRunwaysCsv(csv: string): Map<string, RunwayPair[]> {
+  const map = new Map<string, RunwayPair[]>()
   const lines = csv.split('\n')
+
+  const num = (s: string): number | null => {
+    if (!s) return null
+    const n = parseFloat(s)
+    return Number.isFinite(n) ? n : null
+  }
 
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i]
     if (!line.trim()) continue
 
-    // Columns: airport_ident, length_ft, surface, closed, le_ident, le_heading_degT, he_ident, he_heading_degT
+    // Columns: airport_ident, length_ft, width_ft, surface, closed,
+    //          le_ident, le_heading_degT, le_latitude_deg, le_longitude_deg,
+    //          he_ident, he_heading_degT, he_latitude_deg, he_longitude_deg
     const fields = parseCsvLine(line)
-    if (fields.length < 8) continue
+    if (fields.length < 13) continue
+    if (fields[4] === '1') continue // closed runway
 
     const airportIdent = fields[0]
     const lengthFt = fields[1] ? parseInt(fields[1], 10) || null : null
-    const surface = fields[2] || null
-    const leIdent = fields[4]
-    const leHeadingRaw = fields[5] ? parseFloat(fields[5]) : null
-    const heIdent = fields[6]
-    const heHeadingRaw = fields[7] ? parseFloat(fields[7]) : null
+    const widthFt = fields[2] ? parseInt(fields[2], 10) || null : null
+    const surface = fields[3] || null
+    const leIdent = fields[5]
+    const leHeadingRaw = num(fields[6])
+    const heIdent = fields[9]
+    const heHeadingRaw = num(fields[10])
 
     if (!leIdent && !heIdent) continue
 
@@ -172,19 +214,24 @@ function parseRunwaysCsv(csv: string): Map<string, { le: Runway; he: Runway }[]>
 
     if (leHeading === null && heHeading === null) continue
 
-    const pair = {
+    const pair: RunwayPair = {
       le: {
         ident: leIdent,
         heading: leHeading ?? ((heHeading! + 180) % 360),
         lengthFt,
         surface,
+        lat: num(fields[7]),
+        lon: num(fields[8]),
       },
       he: {
         ident: heIdent,
         heading: heHeading ?? ((leHeading! + 180) % 360),
         lengthFt,
         surface,
+        lat: num(fields[11]),
+        lon: num(fields[12]),
       },
+      widthFt,
     }
 
     const list = map.get(airportIdent)
@@ -202,7 +249,7 @@ function getAirportLookup(): Map<string, string> {
   return airportCodeToIdent
 }
 
-function getRunways(): Map<string, { le: Runway; he: Runway }[]> {
+function getRunways(): Map<string, RunwayPair[]> {
   if (!runwaysByAirport) {
     runwaysByAirport = parseRunwaysCsv(runwaysRaw)
   }
@@ -215,47 +262,128 @@ function headingDelta(a: number, b: number): number {
   return diff
 }
 
+/** Local flat-earth projection: meters east/north of (lat0, lon0). Good to
+ * well under a meter over runway-scale distances. */
+function metersXY(lat0: number, lon0: number, lat: number, lon: number): [number, number] {
+  const x = (lon - lon0) * Math.cos(lat0 * Math.PI / 180) * 111320
+  const y = (lat - lat0) * 111132
+  return [x, y]
+}
+
+function runwayResult(end: Runway, other: Runway, delta: number): RunwayResult {
+  return {
+    runway: end.ident,
+    heading: Math.round(end.heading),
+    headingDelta: Math.round(delta),
+    lengthFt: end.lengthFt,
+    surface: end.surface,
+    reciprocal: other.ident,
+  }
+}
+
+function airportRunways(airportCode: string): RunwayPair[] | null {
+  if (!airportCode) return null
+  const ident = getAirportLookup().get(airportCode.toUpperCase())
+  if (!ident) return null
+  return getRunways().get(ident) ?? null
+}
+
 /**
  * Takes an airport code (IATA like "JFK" or ICAO like "KJFK"),
  * an aircraft heading in degrees, and optionally coordinates,
  * and returns the most probable runway.
+ *
+ * With coordinates, parallel runways (28L/28C/28R share a heading) are
+ * disambiguated by lateral distance to each candidate's extended centerline.
  */
 export function lookupRunway(
   airportCode: string,
   heading: number,
+  lat?: number,
+  lng?: number,
 ): RunwayResult | null {
-  if (!airportCode) return null
-
-  const airports = getAirportLookup()
-  const ident = airports.get(airportCode.toUpperCase())
-  if (!ident) return null
-
-  const runways = getRunways()
-  const pairs = runways.get(ident)
+  const pairs = airportRunways(airportCode)
   if (!pairs || pairs.length === 0) return null
 
-  let best: RunwayResult | null = null
-  let bestDelta = 360
-
+  let best: { end: Runway; other: Runway; delta: number } | null = null
   for (const pair of pairs) {
     for (const end of [pair.le, pair.he] as const) {
       const delta = headingDelta(heading, end.heading)
-      if (delta < bestDelta) {
-        bestDelta = delta
-        const reciprocal = end === pair.le ? pair.he : pair.le
-        best = {
-          runway: end.ident,
-          heading: Math.round(end.heading),
-          headingDelta: Math.round(delta),
-          lengthFt: end.lengthFt,
-          surface: end.surface,
-          reciprocal: reciprocal.ident,
-        }
+      if (!best || delta < best.delta) {
+        best = { end, other: end === pair.le ? pair.he : pair.le, delta }
       }
     }
   }
+  if (!best) return null
 
-  return best
+  if (lat !== undefined && lng !== undefined) {
+    // Candidates that match heading about as well as the best (parallels have
+    // identical headings; allow a few degrees for magnetic/survey noise).
+    let bestCross = Infinity
+    let nearest: { end: Runway; other: Runway; delta: number } | null = null
+    for (const pair of pairs) {
+      const { le, he } = pair
+      if (le.lat === null || le.lon === null || he.lat === null || he.lon === null) continue
+      for (const end of [le, he] as const) {
+        const delta = headingDelta(heading, end.heading)
+        if (delta > best.delta + 5) continue
+        const [vx, vy] = metersXY(le.lat, le.lon, he.lat, he.lon)
+        const len = Math.hypot(vx, vy)
+        if (len < 1) continue
+        const [px, py] = metersXY(le.lat, le.lon, lat, lng)
+        const cross = Math.abs(px * vy - py * vx) / len
+        if (cross < bestCross) {
+          bestCross = cross
+          nearest = { end, other: end === le ? he : le, delta }
+        }
+      }
+    }
+    if (nearest) best = nearest
+  }
+
+  return runwayResult(best.end, best.other, best.delta)
+}
+
+/**
+ * Position-based runway occupancy: is the aircraft physically on a runway at
+ * this airport? Corridor test against each runway's threshold-to-threshold
+ * segment (half-width plus a 25 m margin). Returns the designator whose
+ * heading best matches the aircraft; `headingDelta` near 90 means the
+ * aircraft is crossing rather than lined up. Null when off-runway or when
+ * OurAirports lacks coordinates for this airport's runways.
+ */
+export function lookupRunwayByPosition(
+  airportCode: string,
+  lat: number,
+  lng: number,
+  heading: number,
+): RunwayResult | null {
+  const pairs = airportRunways(airportCode)
+  if (!pairs || pairs.length === 0) return null
+
+  let best: { result: RunwayResult; cross: number } | null = null
+  for (const pair of pairs) {
+    const { le, he } = pair
+    if (le.lat === null || le.lon === null || he.lat === null || he.lon === null) continue
+    const [vx, vy] = metersXY(le.lat, le.lon, he.lat, he.lon)
+    const len = Math.hypot(vx, vy)
+    if (len < 1) continue
+    const [px, py] = metersXY(le.lat, le.lon, lat, lng)
+    const along = (px * vx + py * vy) / len
+    const cross = Math.abs(px * vy - py * vx) / len
+    const halfWidth = Math.max(((pair.widthFt ?? 150) * 0.3048) / 2 + 25, 45)
+    if (along < -40 || along > len + 40 || cross > halfWidth) continue
+    if (!best || cross < best.cross) {
+      const dLe = headingDelta(heading, le.heading)
+      const dHe = headingDelta(heading, he.heading)
+      const end = dLe <= dHe ? le : he
+      best = {
+        cross,
+        result: runwayResult(end, end === le ? he : le, Math.min(dLe, dHe)),
+      }
+    }
+  }
+  return best?.result ?? null
 }
 
 export type FlightPhase =
@@ -322,7 +450,7 @@ export function inferFlightPhase(input: FlightPhaseInput): FlightPhaseResult {
 
   // Check for final approach first (most specific)
   if (altitude <= 3000 && verticalSpeed < 0 && destinationAirportIata) {
-    const runway = lookupRunway(destinationAirportIata, heading)
+    const runway = lookupRunway(destinationAirportIata, heading, input.latitude, input.longitude)
     if (runway && runway.headingDelta <= 30) {
       return { phase: 'final', runway }
     }
@@ -330,7 +458,7 @@ export function inferFlightPhase(input: FlightPhaseInput): FlightPhaseResult {
 
   // Low altitude, descending toward destination
   if (altitude <= 10000 && verticalSpeed < -300 && destinationAirportIata) {
-    const runway = lookupRunway(destinationAirportIata, heading)
+    const runway = lookupRunway(destinationAirportIata, heading, input.latitude, input.longitude)
     return { phase: 'approaching', ...(runway ? { runway } : {}) }
   }
 
@@ -388,6 +516,9 @@ interface TrailAnalysis {
   headingStable: boolean           // heading std dev < 5° over recent ground points
   stabilizedHeading: number | null // circular mean if stable
   takeoffHeading: number | null    // heading during takeoff roll (if detectable)
+  takeoffPosition: { lat: number; lng: number } | null // last ground point before liftoff (on the departure runway)
+  distanceFromStartM: number | null // meters from the oldest trail point (the stand, pre-departure) to current; null if the trail didn't start on the ground
+  hasTaxied: boolean               // trail contains ground movement at taxi speed
   current: TrailPoint
 }
 
@@ -452,8 +583,10 @@ export function analyzeTrail(trail: TrailPoint[]): TrailAnalysis | null {
 
   // Takeoff detection: find the alt 0→non-zero transition (scan full trail)
   let takeoffHeading: number | null = null
+  let takeoffPosition: { lat: number; lng: number } | null = null
   for (let i = 0; i < trail.length - 1; i++) {
     if (trail[i].alt > 0 && trail[i + 1].alt === 0) {
+      takeoffPosition = { lat: trail[i + 1].lat, lng: trail[i + 1].lng }
       // Found the transition. Collect the accelerating ground roll headings.
       const rollHeadings: number[] = []
       for (let j = i + 1; j < Math.min(i + 20, trail.length); j++) {
@@ -471,12 +604,29 @@ export function analyzeTrail(trail: TrailPoint[]): TrailAnalysis | null {
     }
   }
 
+  // Gate departure: how far has the aircraft moved from where its trail began
+  // (the stand, for a flight that hasn't departed yet), and has it ever reached
+  // taxi speed on the ground? FR24 dedupes stationary points, so a parked
+  // aircraft's trail stays clustered at the gate.
+  const oldest = trail[trail.length - 1]
+  const distanceFromStartM = oldest.alt === 0
+    ? Math.round(haversine(current.lat, current.lng, oldest.lat, oldest.lng) * 1000)
+    : null
+  let taxiPoints = 0
+  for (const t of trail) {
+    if (t.alt === 0 && t.spd >= 10) taxiPoints++
+  }
+  const hasTaxied = taxiPoints >= 2
+
   return {
     verticalSpeed: Math.round(verticalSpeed),
     acceleration,
     headingStable,
     stabilizedHeading: stabilizedHeading !== null ? Math.round(stabilizedHeading) : null,
     takeoffHeading: takeoffHeading !== null ? Math.round(takeoffHeading) : null,
+    takeoffPosition,
+    distanceFromStartM,
+    hasTaxied,
     current,
   }
 }
@@ -568,14 +718,18 @@ export function inferPhaseFromTrail(
   ctx: PhaseContext,
 ): EnhancedPhaseResult {
   const { originIata, destIata } = ctx
-  const { current, verticalSpeed, acceleration, headingStable, stabilizedHeading, takeoffHeading } = analysis
+  const {
+    current, verticalSpeed, acceleration, headingStable, stabilizedHeading,
+    takeoffHeading, takeoffPosition, distanceFromStartM, hasTaxied,
+  } = analysis
   const { alt, spd, hd } = current
   const onGround = alt === 0
 
-  // Departure runway (retroactive, from trail)
+  // Departure runway (retroactive, from trail). The liftoff position pins the
+  // exact parallel (09L/09C/09R all match the heading).
   let departureRunway: RunwayResult | undefined
   if (takeoffHeading !== null && originIata) {
-    const rwy = lookupRunway(originIata, takeoffHeading)
+    const rwy = lookupRunway(originIata, takeoffHeading, takeoffPosition?.lat, takeoffPosition?.lng)
     if (rwy && rwy.headingDelta <= 20) departureRunway = rwy
   }
 
@@ -599,20 +753,21 @@ export function inferPhaseFromTrail(
           : 'Arrived'
       return { state: 'parked', label, departureRunway }
     }
-    if (spd <= 2) {
-      const gate = hasDeparted ? destGateStr : originGateStr
-      const label = gate ? `At gate ${gate}` : hasDeparted ? 'Arrived' : 'At gate'
-      return { state: 'parked', label, departureRunway }
-    }
-    if (spd >= 30 && acceleration > 0.5 && headingStable) {
-      const rwy = lookupRunway(originIata, stabilizedHeading ?? hd)
+
+    // Physical runway occupancy from position (available where OurAirports has
+    // threshold coordinates; null elsewhere, and every use below falls back to
+    // the heading-only lookup).
+    const rwyHere = lookupRunwayByPosition(hasDeparted ? destIata : originIata, current.lat, current.lng, hd)
+
+    if (spd >= 30 && acceleration > 0.5 && (headingStable || rwyHere)) {
+      const rwy = rwyHere ?? lookupRunway(originIata, stabilizedHeading ?? hd, current.lat, current.lng)
       const label = rwy && rwy.headingDelta <= 20
         ? `Taking off from ${rwy.runway}`
         : 'Taking off'
       return { state: 'takeoff_roll', label, runway: rwy ?? undefined, departureRunway }
     }
     if (spd >= 30 && acceleration <= 0) {
-      const rwy = lookupRunway(destIata, hd)
+      const rwy = rwyHere ?? lookupRunway(destIata, hd, current.lat, current.lng)
       const label = rwy && rwy.headingDelta <= 20
         ? `Landed on ${rwy.runway}`
         : 'Landed'
@@ -624,6 +779,44 @@ export function inferPhaseFromTrail(
         ? { state: 'takeoff_roll', label: 'Taking off', departureRunway }
         : { state: 'landed', label: 'Landed', departureRunway }
     }
+
+    // Below taxi-roll speed but physically on a runway
+    if (rwyHere) {
+      if (rwyHere.headingDelta > 45) {
+        return { state: 'taxiing', label: `Crossing runway ${rwyHere.runway}`, runway: rwyHere, departureRunway }
+      }
+      if (!hasDeparted) {
+        const label = spd <= 7
+          ? `Lining up runway ${rwyHere.runway}`
+          : `On runway ${rwyHere.runway}`
+        return { state: 'taxiing', label, runway: rwyHere, departureRunway }
+      }
+      if (spd >= 10) {
+        // Aligned on the arrival runway at rollout-exit speed
+        return { state: 'landed', label: `Landed on ${rwyHere.runway}`, runway: rwyHere, departureRunway }
+      }
+    }
+
+    // Has the aircraft left its stand? Pre-departure the trail starts at the
+    // gate, so either sustained taxi movement or real displacement means a
+    // subsequent stop is a hold (deice pad, runway queue), not "At gate".
+    const leftGate = !hasDeparted && (hasTaxied || (distanceFromStartM ?? 0) > 100)
+
+    if (spd <= 2) {
+      if (leftGate) {
+        return { state: 'taxiing', label: 'Holding', departureRunway }
+      }
+      const gate = hasDeparted ? destGateStr : originGateStr
+      const label = gate ? `At gate ${gate}` : hasDeparted ? 'Arrived' : 'At gate'
+      return { state: 'parked', label, departureRunway }
+    }
+
+    // Slow crawl that hasn't yet reached taxi speed or left the stand area
+    if (!hasDeparted && spd <= 7 && !hasTaxied && (distanceFromStartM ?? Infinity) < 150) {
+      const label = originGateStr ? `Pushing back from gate ${originGateStr}` : 'Pushing back'
+      return { state: 'taxiing', label, departureRunway }
+    }
+
     let taxiLabel = 'Taxiing'
     if (hasDeparted && destGateStr) {
       taxiLabel = `Taxiing to ${destGateStr}`
@@ -637,7 +830,7 @@ export function inferPhaseFromTrail(
 
   // Final approach: low, descending, aligned with destination runway
   if (alt <= 3000 && verticalSpeed < 0 && destIata) {
-    const rwy = lookupRunway(destIata, hd)
+    const rwy = lookupRunway(destIata, hd, current.lat, current.lng)
     if (rwy && rwy.headingDelta <= 30) {
       return {
         state: 'final_approach',
@@ -650,7 +843,7 @@ export function inferPhaseFromTrail(
 
   // Approach: below 10k, descending toward destination
   if (alt <= 10000 && verticalSpeed < -300 && destIata) {
-    const rwy = lookupRunway(destIata, hd)
+    const rwy = lookupRunway(destIata, hd, current.lat, current.lng)
     const rwySuffix = rwy ? ` - ${rwy.runway}` : ''
     return {
       state: 'approach',
@@ -736,11 +929,11 @@ export function transformFlightDetail(raw: any) {
   }
 
   //Format the display name, removing any parenthetical livery info and "Airline" suffixes
-  displayName = displayName
+  displayName = (displayName ?? callsign ?? '')
     .replace(/\s*\((?=[^)]*livery)[^)]*\)/ig, '')
     .replace(/\bAir\s*Lines?\b/ig, '')
     .replace(/\s{2,}/g, ' ')
-    .trim()
+    .trim() || null
 
   // ── Aircraft ──
   const aircraft = raw.aircraft ?? {}
