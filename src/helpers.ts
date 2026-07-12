@@ -560,6 +560,7 @@ export interface PhaseContext {
   destGate?: string | null
   destTerminal?: string | null
   actualDeparture?: number | null
+  actualArrival?: number | null
 }
 
 export function inferPhaseFromTrail(
@@ -583,9 +584,21 @@ export function inferPhaseFromTrail(
   const destGateStr = formatGate(ctx.destTerminal ?? null, ctx.destGate ?? null)
   // If the flight has an actual departure time, it already took off → ground = destination
   const hasDeparted = !!ctx.actualDeparture
+  const hasArrived = !!ctx.actualArrival
 
   // ── Ground states ──
   if (onGround) {
+    // Once FR24 records an actual arrival the flight is complete: it is at (or
+    // taxiing to) its arrival gate. Report "At gate" rather than "Taxiing to…"
+    // or a bare "Arrived", regardless of any residual taxi speed.
+    if (hasArrived) {
+      const label = destGateStr
+        ? `At gate ${destGateStr}`
+        : destIata
+          ? `At ${destIata}`
+          : 'Arrived'
+      return { state: 'parked', label, departureRunway }
+    }
     if (spd <= 2) {
       const gate = hasDeparted ? destGateStr : originGateStr
       const label = gate ? `At gate ${gate}` : hasDeparted ? 'Arrived' : 'At gate'
@@ -816,6 +829,7 @@ export function transformFlightDetail(raw: any) {
       destGate: destination?.gate,
       destTerminal: destination?.terminal,
       actualDeparture: actualDep,
+      actualArrival: actualArr,
     })
   }
 
@@ -881,6 +895,9 @@ export function transformFlightDetail(raw: any) {
     status: {
       live: raw.status?.live ?? false,
       text: raw.status?.text ?? null,
+      // True once the flight has actually arrived (landed & at/taxiing to gate).
+      // Lets clients optionally skip completed flights.
+      arrived: actualArr != null,
     },
   }
 }

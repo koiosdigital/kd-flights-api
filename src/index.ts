@@ -12,10 +12,12 @@ import { verifySignature } from './signing'
 import {
   liveFeed,
   flightDetails,
+  searchFlights,
   type BoundingBox,
   type LiveFlight,
   type FlightDetailsResult,
 } from './grpc'
+import { lookupAirport } from './airports'
 import openApiSpec from './openapi.yaml'
 
 const CACHE_TTL = 60          // seconds — shared "fresh" cache (KV minimum is 60)
@@ -89,6 +91,50 @@ async function withRetry<T>(fn: () => Promise<T | null>, attempts = 3): Promise<
   if (lastErr) console.log('withRetry exhausted:', String(lastErr))
   return null
 }
+
+/**
+ * Flight-number search for the config picker/typeahead. `query` accepts an IATA
+ * flight number (`UA962`) or ICAO callsign (`UAL962`). Returns currently-live
+ * matches shaped for a picker: `{ value, display, callsign, route }`, where
+ * `value` is the FR24 hex id the client tracks.
+ */
+app.get('/flights/search', async (c) => {
+  const query = (c.req.query('query') ?? c.req.query('q') ?? '').trim()
+  if (query.length < 2) {
+    return c.json({ results: [] })
+  }
+
+  const matches = await searchFlights(query, 20).catch(() => [])
+
+  const results = matches
+    .filter((f) => f.callsign) // skip anonymous/blocked entries
+    .map((f) => {
+      const from = lookupAirport(f.from)
+      const to = lookupAirport(f.to)
+      const route = f.from && f.to ? `${f.from} → ${f.to}` : ''
+      const parts = [f.callsign]
+      if (route) parts.push(route)
+      if (f.type) parts.push(f.type)
+      return {
+        // `value` is the stable callsign the client stores and re-searches each
+        // render (the hex `id` changes per flight instance / day).
+        value: f.callsign,
+        display: parts.join('  ·  '),
+        callsign: f.callsign,
+        id: f.hexId,
+        registration: f.reg || null,
+        type: f.type || null,
+        route: {
+          origin: f.from || null,
+          originName: from?.name ?? null,
+          destination: f.to || null,
+          destName: to?.name ?? null,
+        },
+      }
+    })
+
+  return c.json({ results })
+})
 
 app.get('/flights/:id', async (c) => {
   const id = c.req.param('id')

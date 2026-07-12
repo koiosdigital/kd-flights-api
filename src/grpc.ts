@@ -337,6 +337,68 @@ export interface LiveFeedResult {
   selected: LiveFlight[]
 }
 
+const WORLD: BoundingBox = { north: 90, south: -90, west: -180, east: 180 }
+
+function searchWorldBase(): Writer[] {
+  const bounds = new Writer()
+    .floatField(1, WORLD.north)
+    .floatField(2, WORLD.south)
+    .floatField(3, WORLD.west)
+    .floatField(4, WORLD.east)
+  const settings = new Writer()
+    .packedVarint(1, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    .packedVarint(2, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+    .varintField(3, 3)
+  const fieldMask = new Writer()
+    .stringField(1, 'flight')
+    .stringField(1, 'reg')
+    .stringField(1, 'route')
+    .stringField(1, 'type')
+  return [bounds, settings, fieldMask]
+}
+
+async function feedWithFilter(filter: Writer, limit: number): Promise<LiveFlight[]> {
+  const [bounds, settings, fieldMask] = searchWorldBase()
+  const req = new Writer()
+    .messageField(1, bounds)
+    .messageField(2, settings)
+    .messageField(3, filter)
+    .varintField(7, limit)
+    .varintField(8, 14400)
+    .messageField(10, fieldMask)
+    .finish()
+  const payload = await callFeed('LiveFeed', req)
+  if (!payload) return []
+  return getRepeated(decode(payload), 1).map((f) => parseFlight(decode(f.bytes!)))
+}
+
+/**
+ * Search live flights by IATA flight number (`UA962`) or ICAO callsign
+ * (`UAL962`). FR24's LiveFeed `Filter` matches `flights_list` (field 8) against
+ * IATA numbers and `callsigns_list` (field 4) against ICAO callsigns — but
+ * multiple filter fields are AND-ed, so we fire the two forms as separate
+ * queries in parallel and merge, deduping by flight id.
+ */
+export async function searchFlights(query: string, limit = 20): Promise<LiveFlight[]> {
+  const q = query.trim().toUpperCase()
+  if (!q) return []
+
+  const [byCallsign, byNumber] = await Promise.all([
+    feedWithFilter(new Writer().stringField(4, q), limit).catch(() => []),
+    feedWithFilter(new Writer().stringField(8, q), limit).catch(() => []),
+  ])
+
+  const seen = new Set<number>()
+  const out: LiveFlight[] = []
+  for (const flight of [...byCallsign, ...byNumber]) {
+    if (!seen.has(flight.flightid)) {
+      seen.add(flight.flightid)
+      out.push(flight)
+    }
+  }
+  return out.slice(0, limit)
+}
+
 export async function liveFeed(opts: {
   bbox: BoundingBox
   limit?: number
