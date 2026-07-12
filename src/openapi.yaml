@@ -329,7 +329,24 @@ components:
             runway 28C", "On runway 28C", "Crossing runway 10C" (all state
             `taxiing`), then "Taking off from 10L" / "Landed on 27L".
             Runway occupancy labels come from a position test against runway
-            geometry where OurAirports has threshold coordinates.
+            geometry where OurAirports has threshold coordinates. Gate and
+            taxiway names come from OpenStreetMap surface data, fetched per
+            airport on demand and cached — labels may briefly lack names for
+            an airport not seen recently.
+        gate:
+          type: string
+          nullable: true
+          description: >
+            Gate/stand the aircraft is parked at, position-matched against
+            OpenStreetMap `aeroway=gate` nodes (e.g. "H16"). Only present for
+            parked phases where FR24 supplies no gate (FR24 only carries the
+            arrival gate).
+        taxiway:
+          type: string
+          nullable: true
+          description: >
+            Named taxiway the aircraft is on while taxiing or holding,
+            position-matched against OpenStreetMap centerlines (e.g. "B").
         departureRunway:
           $ref: "#/components/schemas/RunwayInfo"
         runway:

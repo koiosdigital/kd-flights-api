@@ -5,6 +5,7 @@ import {
   type GeoJSONFeatureCollection,
 } from './types'
 import { transformFlightDetail, computeObserver, airlineIcaosForIata } from './helpers'
+import { enrichGroundPhase } from './taxiways'
 import { buildRawDetail, buildRawFromLive } from './adapt'
 import { pointInPolygon, haversine } from './geojson'
 import { resolveUnitOptions, buildUnitsMeta, convertFlightResult, convertDistanceFromKm } from './units'
@@ -258,6 +259,10 @@ app.get('/flights/:id', async (c) => {
     })
 
     if (result) {
+      // OSM gate/taxiway names for ground phases ("At gate H16", "Taxiing on
+      // B"). No-op until the airport's surface cache is warm, so an unenriched
+      // result may get cached — the 60s TTL self-heals on the next rebuild.
+      await enrichGroundPhase(result, kv, c.executionCtx)
       c.executionCtx.waitUntil(Promise.all([
         kv.put(key, JSON.stringify(result), { expirationTtl: CACHE_TTL }),
         kv.put(lastGoodKey, JSON.stringify(result), { expirationTtl: LAST_GOOD_TTL }),
