@@ -766,7 +766,7 @@ export function inferPhaseFromTrail(
         : 'Taking off'
       return { state: 'takeoff_roll', label, runway: rwy ?? undefined, departureRunway }
     }
-    if (spd >= 30 && acceleration <= 0) {
+    if (spd >= 30 && acceleration <= 0 && hasDeparted) {
       const rwy = rwyHere ?? lookupRunway(destIata, hd, current.lat, current.lng)
       const label = rwy && rwy.headingDelta <= 20
         ? `Landed on ${rwy.runway}`
@@ -774,6 +774,16 @@ export function inferPhaseFromTrail(
       return { state: 'landed', label, runway: rwy ?? undefined, departureRunway }
     }
     if (spd >= 30) {
+      // A flight with no recorded departure can't have landed: flat/negative
+      // acceleration here is speed-sample noise mid-roll (or a rejected
+      // takeoff, which reads better as a takeoff than as a landing).
+      if (!hasDeparted) {
+        const rwy = rwyHere ?? lookupRunway(originIata, stabilizedHeading ?? hd, current.lat, current.lng)
+        const label = rwy && rwy.headingDelta <= 20
+          ? `Taking off from ${rwy.runway}`
+          : 'Taking off'
+        return { state: 'takeoff_roll', label, runway: rwy ?? undefined, departureRunway }
+      }
       // Edge case: high speed but ambiguous acceleration
       return verticalSpeed > 0
         ? { state: 'takeoff_roll', label: 'Taking off', departureRunway }

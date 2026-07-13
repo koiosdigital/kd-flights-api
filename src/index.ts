@@ -85,6 +85,13 @@ app.get('/swagger.yaml', (c) => {
 
 app.get('/health', (c) => c.json({ status: 'ok' }))
 
+/**
+ * FR24 tracks airport ops/follow-me trucks as pseudo-flights with aircraft
+ * type "GRND" (some carry airline-flight-lookalike callsigns such as `AA22`
+ * at ORD). Never search, list, or follow them.
+ */
+const isGroundVehicle = (f: { type?: string | null }) => f.type === 'GRND'
+
 /** Retry an async op a few times; returns null if every attempt throws/empties. */
 async function withRetry<T>(fn: () => Promise<T | null>, attempts = 3): Promise<T | null> {
   let lastErr: unknown = null
@@ -167,6 +174,7 @@ app.get('/flights/search', async (c) => {
   ])
   const seen = new Set<number>()
   const matches = [...exact, ...prefix]
+    .filter((f) => !isGroundVehicle(f))
     .filter((f) => (seen.has(f.flightid) ? false : (seen.add(f.flightid), true)))
     .slice(0, 20)
   console.log(`search(${query}): ${exact.length} exact + ${prefix.length} prefix -> ${matches.length}`)
@@ -277,6 +285,12 @@ app.get('/flights/:id', async (c) => {
     }
   }
 
+  // Ground vehicles are never followable, even by direct id (covers fresh,
+  // cached, and stale-while-error results alike).
+  if (isGroundVehicle({ type: result.aircraft?.typeCode })) {
+    return c.json({ error: 'Flight not found or not live' }, 404)
+  }
+
   // Per-request observer data on top of the shared base result
   if (observerLat !== undefined && observerLng !== undefined && result.telemetry) {
     result = {
@@ -359,8 +373,11 @@ app.post('/flights/nearby', async (c) => {
 
   if (!allFlights) return c.json([])
 
-  // Filter to flights actually inside the polygon
-  const flights = allFlights.filter((f) => pointInPolygon(f.lon, f.lat, outerRing))
+  // Filter to flights actually inside the polygon (cached lists may still
+  // contain ground vehicles, so exclude them at read time)
+  const flights = allFlights.filter(
+    (f) => !isGroundVehicle(f) && pointInPolygon(f.lon, f.lat, outerRing),
+  )
 
   // Blocked callsigns sort to the bottom
   const isBlocked = (cs: string | null) =>

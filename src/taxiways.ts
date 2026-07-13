@@ -31,7 +31,13 @@ export interface AirportSurface {
   gates: GateNode[]
 }
 
-const OVERPASS_URL = 'https://overpass-api.de/api/interpreter'
+// Tried in order; Cloudflare egress IPs are shared, so the primary instance
+// may rate-limit (429) or reject (403/406) where a mirror accepts us.
+const OVERPASS_URLS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+]
 const SURFACE_TTL = 30 * 86400 // seconds — OSM airport layouts change rarely
 const FETCH_LOCK_TTL = 300     // seconds — rate-limit Overpass attempts per airport
 const SEARCH_RADIUS_M = 6000   // from airport reference point; covers the largest fields
@@ -46,22 +52,8 @@ async function fetchSurface(lat: number, lng: number): Promise<AirportSurface | 
     `[out:json][timeout:15];` +
     `(way[aeroway=taxiway][ref](around:${SEARCH_RADIUS_M},${lat},${lng});` +
     `node[aeroway=gate][ref](around:${SEARCH_RADIUS_M},${lat},${lng}););out geom;`
-  const res = await fetch(OVERPASS_URL, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/x-www-form-urlencoded',
-      accept: 'application/json',
-      // Overpass rejects UA-less requests (406) and its usage policy asks for
-      // an identifying agent. Workers send no default User-Agent.
-      'user-agent': 'koios-flights-api/1.0 (https://flights-api.koiosdigital.net)',
-    },
-    body: `data=${encodeURIComponent(query)}`,
-  })
-  if (!res.ok) {
-    console.log(`overpass HTTP ${res.status}`)
-    return null
-  }
-  const json = await res.json() as {
+
+  let json: {
     elements?: {
       type: string
       lat?: number
@@ -69,8 +61,35 @@ async function fetchSurface(lat: number, lng: number): Promise<AirportSurface | 
       geometry?: { lat: number; lon: number }[]
       tags?: { ref?: string }
     }[]
+  } | null = null
+
+  for (const url of OVERPASS_URLS) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+          accept: 'application/json',
+          // Overpass rejects UA-less requests (406) and its usage policy asks
+          // for an identifying agent. Workers send no default User-Agent.
+          'user-agent': 'koios-flights-api/1.0 (https://flights-api.koiosdigital.net)',
+        },
+        body: `data=${encodeURIComponent(query)}`,
+      })
+      if (!res.ok) {
+        console.log(`overpass ${new URL(url).hostname} HTTP ${res.status}`)
+        continue
+      }
+      json = await res.json()
+      break
+    } catch (e) {
+      console.log(`overpass ${new URL(url).hostname} threw: ${String(e)}`)
+    }
   }
-  if (!Array.isArray(json.elements)) return null
+  if (!json || !Array.isArray(json.elements)) {
+    if (json) console.log('overpass response had no elements array')
+    return null
+  }
 
   const taxiways: TaxiwayWay[] = []
   const gates: GateNode[] = []
@@ -111,7 +130,10 @@ export async function getAirportSurface(
     })
     if (surface) {
       console.log(`surface cached for ${icao}: ${surface.taxiways.length} taxiways, ${surface.gates.length} gates`)
-      await kv.put(surfaceKey(icao), JSON.stringify(surface), { expirationTtl: SURFACE_TTL })
+      // An empty result may be a soft Overpass timeout (200 + no elements) or
+      // an unmapped airport — cache briefly rather than for a month.
+      const ttl = surface.taxiways.length || surface.gates.length ? SURFACE_TTL : 86400
+      await kv.put(surfaceKey(icao), JSON.stringify(surface), { expirationTtl: ttl })
     }
   })())
   return null
