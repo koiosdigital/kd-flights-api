@@ -92,6 +92,20 @@ app.get('/health', (c) => c.json({ status: 'ok' }))
  */
 const isGroundVehicle = (f: { type?: string | null }) => f.type === 'GRND'
 
+/**
+ * Coalesce concurrent upstream rebuilds of the same cache key within this
+ * isolate: after a TTL expiry every in-flight request would otherwise fire its
+ * own FR24 fetch (cache stampede). First caller runs `fn`; the rest await it.
+ */
+const inflight = new Map<string, Promise<unknown>>()
+function coalesce<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const existing = inflight.get(key)
+  if (existing) return existing as Promise<T>
+  const p = fn().finally(() => inflight.delete(key))
+  inflight.set(key, p)
+  return p
+}
+
 /** Retry an async op a few times; returns null if every attempt throws/empties. */
 async function withRetry<T>(fn: () => Promise<T | null>, attempts = 3): Promise<T | null> {
   let lastErr: unknown = null
@@ -108,6 +122,23 @@ async function withRetry<T>(fn: () => Promise<T | null>, attempts = 3): Promise<
 }
 
 /**
+ * Airline fleet list for the typeahead's prefix search. Successive keystrokes
+ * (`UA9` → `UA96` → `UA962`) all need the same fleet, so cache it per ICAO —
+ * each keystroke then costs a KV read plus an in-memory prefix filter instead
+ * of a full upstream fleet pull.
+ */
+async function cachedFleet(kv: KVNamespace, ctx: ExecutionContext, icao: string): Promise<LiveFlight[]> {
+  const key = `fleet:${icao}`
+  const cached = await kv.get(key, 'json') as LiveFlight[] | null
+  if (cached) return cached
+  const fleet = await coalesce(key, () => liveFlightsByAirline(icao))
+  if (fleet.length > 0) {
+    ctx.waitUntil(kv.put(key, JSON.stringify(fleet), { expirationTtl: CACHE_TTL }))
+  }
+  return fleet
+}
+
+/**
  * Live prefix matching for the typeahead. FR24's `flights_list`/`callsigns_list`
  * filters are exact-match only, so for partial input (`UA96`) we parse off the
  * airline designator, pull that airline's live fleet via the airline filter, and
@@ -115,14 +146,14 @@ async function withRetry<T>(fn: () => Promise<T | null>, attempts = 3): Promise<
  * also catches regional feeders like `SKW5328` = `UA5328`) and against the
  * callsign for `UAL96`-style queries.
  */
-async function prefixSearchLive(q: string, limit: number): Promise<LiveFlight[]> {
+async function prefixSearchLive(q: string, limit: number, kv: KVNamespace, ctx: ExecutionContext): Promise<LiveFlight[]> {
   const m = q.match(/^([A-Z0-9]{2}|[A-Z]{3})(\d{0,4}[A-Z]?)$/)
   if (!m || /^\d+$/.test(m[1])) return []
   const code = m[1]
   const icaos = code.length === 3 ? [code] : airlineIcaosForIata(code)
   if (icaos.length === 0) return []
 
-  const fleets = await Promise.all(icaos.map((icao) => liveFlightsByAirline(icao).catch(() => [])))
+  const fleets = await Promise.all(icaos.map((icao) => cachedFleet(kv, ctx, icao).catch(() => [])))
   const matches = fleets.flat().filter(
     (f) => f.flightNumber.startsWith(q) || f.callsign.startsWith(q),
   )
@@ -167,10 +198,19 @@ app.get('/flights/search', async (c) => {
     return c.json({ results: [] })
   }
 
+  // Typeahead fires per keystroke across many devices, so cache the finished
+  // result list per normalized query.
+  const kv = c.env.CACHE
+  const cacheKey = `search:${query}`
+  const cachedResults = await kv.get(cacheKey, 'json')
+  if (cachedResults) {
+    return c.json({ results: cachedResults })
+  }
+
   // Exact filter search catches anything the prefix path can't parse
   const [exact, prefix] = await Promise.all([
     searchFlights(query, 20).catch(() => []),
-    prefixSearchLive(query, 20).catch(() => []),
+    prefixSearchLive(query, 20, kv, c.executionCtx).catch(() => []),
   ])
   const seen = new Set<number>()
   const matches = [...exact, ...prefix]
@@ -209,6 +249,7 @@ app.get('/flights/search', async (c) => {
       }
     })
 
+  c.executionCtx.waitUntil(kv.put(cacheKey, JSON.stringify(results), { expirationTtl: CACHE_TTL }))
   return c.json({ results })
 })
 
@@ -243,10 +284,11 @@ app.get('/flights/:id', async (c) => {
   const key = `flight:${id}`
   const lastGoodKey = `flight-lg:${id}`
 
-  // Base result (without observer) is shared across all users/units.
-  let result = await kv.get(key, 'json') as any
-  if (!result) {
-    result = await withRetry(async () => {
+  // Full upstream rebuild, coalesced so concurrent misses share one FR24
+  // fetch. Writes both cache tiers before resolving; returns null when the
+  // flight isn't found upstream.
+  const rebuild = () => coalesce(key, async () => {
+    const fresh = await withRetry(async () => {
       // FlightDetails carries everything except the plain IATA origin/destination
       // codes; a selected-id LiveFeed query is the only source for those.
       const [detail, feed] = await Promise.all([
@@ -266,19 +308,31 @@ app.get('/flights/:id', async (c) => {
       return null
     })
 
-    if (result) {
+    if (fresh) {
       // OSM gate/taxiway names for ground phases ("At gate H16", "Taxiing on
       // B"). No-op until the airport's surface cache is warm, so an unenriched
       // result may get cached — the 60s TTL self-heals on the next rebuild.
-      await enrichGroundPhase(result, kv, c.executionCtx)
-      c.executionCtx.waitUntil(Promise.all([
-        kv.put(key, JSON.stringify(result), { expirationTtl: CACHE_TTL }),
-        kv.put(lastGoodKey, JSON.stringify(result), { expirationTtl: LAST_GOOD_TTL }),
-      ]))
+      await enrichGroundPhase(fresh, kv, c.executionCtx)
+      await Promise.all([
+        kv.put(key, JSON.stringify(fresh), { expirationTtl: CACHE_TTL }),
+        kv.put(lastGoodKey, JSON.stringify(fresh), { expirationTtl: LAST_GOOD_TTL }),
+      ])
+    }
+    return fresh
+  })
+
+  // Base result (without observer) is shared across all users/units.
+  let result = await kv.get(key, 'json') as any
+  if (!result) {
+    // Stale-while-revalidate: serve the last good detail immediately and
+    // refresh in the background, so a TTL expiry never blocks the request.
+    // The same copy doubles as stale-while-error when FR24 is down.
+    result = await kv.get(lastGoodKey, 'json') as any
+    if (result) {
+      c.executionCtx.waitUntil(rebuild())
     } else {
-      // Stale-while-error: FR24 momentarily failed — serve the last good detail
-      // rather than a 500, so the display never blanks for a live flight.
-      result = await kv.get(lastGoodKey, 'json') as any
+      // First sight of this flight — nothing to serve until FR24 answers.
+      result = await rebuild()
       if (!result) {
         return c.json({ error: 'Flight not found or not live' }, 404)
       }
@@ -352,22 +406,33 @@ app.post('/flights/nearby', async (c) => {
   const lastGoodKey = `feed-lg:${bboxKey}`
 
   const kv = c.env.CACHE
-  let allFlights = await kv.get(bboxKey, 'json') as LiveFlight[] | null
 
-  if (!allFlights) {
+  // Coalesced upstream rebuild — concurrent misses on the same bbox (a burst
+  // of device renders after TTL expiry) share one FR24 fetch.
+  const rebuild = () => coalesce(bboxKey, async () => {
     const feed = await withRetry(async () => {
       const r = await liveFeed({ bbox })
       return r.flights.length > 0 ? r.flights : null
     })
     if (feed) {
-      allFlights = feed
-      c.executionCtx.waitUntil(Promise.all([
+      await Promise.all([
         kv.put(bboxKey, JSON.stringify(feed), { expirationTtl: CACHE_TTL }),
         kv.put(lastGoodKey, JSON.stringify(feed), { expirationTtl: LAST_GOOD_TTL }),
-      ]))
+      ])
+    }
+    return feed
+  })
+
+  let allFlights = await kv.get(bboxKey, 'json') as LiveFlight[] | null
+
+  if (!allFlights) {
+    // Stale-while-revalidate: serve the last good list and refresh in the
+    // background; doubles as stale-while-error when FR24 is down.
+    allFlights = await kv.get(lastGoodKey, 'json') as LiveFlight[] | null
+    if (allFlights) {
+      c.executionCtx.waitUntil(rebuild())
     } else {
-      // Stale-while-error rather than returning an empty list.
-      allFlights = await kv.get(lastGoodKey, 'json') as LiveFlight[] | null
+      allFlights = await rebuild()
     }
   }
 
