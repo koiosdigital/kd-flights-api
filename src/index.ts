@@ -106,6 +106,35 @@ function coalesce<T>(key: string, fn: () => Promise<T>): Promise<T> {
   return p
 }
 
+/**
+ * In-isolate L0 cache in front of KV. A KV read from a colo that hasn't seen
+ * the key recently goes to the central store (~100-300ms); hot keys on a busy
+ * isolate skip that entirely. Values are cloned on both put and get because
+ * downstream code (convertFlightResult, observer merge) mutates results in
+ * place. FIFO-bounded; entries die with the isolate anyway.
+ */
+const L0_MAX_ENTRIES = 128
+const l0 = new Map<string, { value: unknown; expiresAt: number }>()
+
+function l0Put(key: string, value: unknown, ttlSeconds: number): void {
+  if (!l0.has(key) && l0.size >= L0_MAX_ENTRIES) {
+    l0.delete(l0.keys().next().value!)
+  }
+  l0.set(key, { value: structuredClone(value), expiresAt: Date.now() + ttlSeconds * 1000 })
+}
+
+/**
+ * Read-through L0 → KV. KV hits enter L0 at half TTL so total staleness can't
+ * stack much past CACHE_TTL; rebuilds insert at full TTL since they're fresh.
+ */
+async function cacheGet<T>(kv: KVNamespace, key: string): Promise<T | null> {
+  const hot = l0.get(key)
+  if (hot && Date.now() < hot.expiresAt) return structuredClone(hot.value) as T
+  const val = await kv.get(key, 'json') as T | null
+  if (val !== null) l0Put(key, val, CACHE_TTL / 2)
+  return val
+}
+
 /** Retry an async op a few times; returns null if every attempt throws/empties. */
 async function withRetry<T>(fn: () => Promise<T | null>, attempts = 3): Promise<T | null> {
   let lastErr: unknown = null
@@ -129,10 +158,11 @@ async function withRetry<T>(fn: () => Promise<T | null>, attempts = 3): Promise<
  */
 async function cachedFleet(kv: KVNamespace, ctx: ExecutionContext, icao: string): Promise<LiveFlight[]> {
   const key = `fleet:${icao}`
-  const cached = await kv.get(key, 'json') as LiveFlight[] | null
+  const cached = await cacheGet<LiveFlight[]>(kv, key)
   if (cached) return cached
   const fleet = await coalesce(key, () => liveFlightsByAirline(icao))
   if (fleet.length > 0) {
+    l0Put(key, fleet, CACHE_TTL)
     ctx.waitUntil(kv.put(key, JSON.stringify(fleet), { expirationTtl: CACHE_TTL }))
   }
   return fleet
@@ -202,7 +232,7 @@ app.get('/flights/search', async (c) => {
   // result list per normalized query.
   const kv = c.env.CACHE
   const cacheKey = `search:${query}`
-  const cachedResults = await kv.get(cacheKey, 'json')
+  const cachedResults = await cacheGet(kv, cacheKey)
   if (cachedResults) {
     return c.json({ results: cachedResults })
   }
@@ -249,6 +279,7 @@ app.get('/flights/search', async (c) => {
       }
     })
 
+  l0Put(cacheKey, results, CACHE_TTL)
   c.executionCtx.waitUntil(kv.put(cacheKey, JSON.stringify(results), { expirationTtl: CACHE_TTL }))
   return c.json({ results })
 })
@@ -313,6 +344,7 @@ app.get('/flights/:id', async (c) => {
       // B"). No-op until the airport's surface cache is warm, so an unenriched
       // result may get cached — the 60s TTL self-heals on the next rebuild.
       await enrichGroundPhase(fresh, kv, c.executionCtx)
+      l0Put(key, fresh, CACHE_TTL)
       await Promise.all([
         kv.put(key, JSON.stringify(fresh), { expirationTtl: CACHE_TTL }),
         kv.put(lastGoodKey, JSON.stringify(fresh), { expirationTtl: LAST_GOOD_TTL }),
@@ -322,20 +354,23 @@ app.get('/flights/:id', async (c) => {
   })
 
   // Base result (without observer) is shared across all users/units.
-  let result = await kv.get(key, 'json') as any
+  let result = await cacheGet<any>(kv, key)
   if (!result) {
     // Stale-while-revalidate: serve the last good detail immediately and
     // refresh in the background, so a TTL expiry never blocks the request.
     // The same copy doubles as stale-while-error when FR24 is down.
-    result = await kv.get(lastGoodKey, 'json') as any
+    result = await cacheGet<any>(kv, lastGoodKey)
     if (result) {
       c.executionCtx.waitUntil(rebuild())
     } else {
       // First sight of this flight — nothing to serve until FR24 answers.
-      result = await rebuild()
-      if (!result) {
+      // Clone: coalesced waiters share one object, and unit/observer
+      // conversion below mutates it in place.
+      const built = await rebuild()
+      if (!built) {
         return c.json({ error: 'Flight not found or not live' }, 404)
       }
+      result = structuredClone(built)
     }
   }
 
@@ -415,6 +450,7 @@ app.post('/flights/nearby', async (c) => {
       return r.flights.length > 0 ? r.flights : null
     })
     if (feed) {
+      l0Put(bboxKey, feed, CACHE_TTL)
       await Promise.all([
         kv.put(bboxKey, JSON.stringify(feed), { expirationTtl: CACHE_TTL }),
         kv.put(lastGoodKey, JSON.stringify(feed), { expirationTtl: LAST_GOOD_TTL }),
@@ -423,12 +459,12 @@ app.post('/flights/nearby', async (c) => {
     return feed
   })
 
-  let allFlights = await kv.get(bboxKey, 'json') as LiveFlight[] | null
+  let allFlights = await cacheGet<LiveFlight[]>(kv, bboxKey)
 
   if (!allFlights) {
     // Stale-while-revalidate: serve the last good list and refresh in the
     // background; doubles as stale-while-error when FR24 is down.
-    allFlights = await kv.get(lastGoodKey, 'json') as LiveFlight[] | null
+    allFlights = await cacheGet<LiveFlight[]>(kv, lastGoodKey)
     if (allFlights) {
       c.executionCtx.waitUntil(rebuild())
     } else {
